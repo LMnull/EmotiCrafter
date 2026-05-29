@@ -1,0 +1,11 @@
+VA pred_valence: -0.132 ± 1.119
+VA pred_arousal: 0.037 ± 0.507
+VA valence_abs_error: 1.414 ± 1.007
+VA arousal_abs_error: 1.802 ± 1.089
+num_images: 3300
+
+CLIPScore: 19.424 ± 4.475
+num_images: 3300
+
+CLIP-IQA: 0.542 ± 0.018
+num_images: 3300

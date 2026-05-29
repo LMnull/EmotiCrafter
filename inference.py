@@ -40,8 +40,8 @@ if __name__ == "__main__":
     parser.add_argument('--prompt', type = str)
     parser.add_argument('--arousal', type = float)
     parser.add_argument('--valence', type = float)
-    parser.add_argument('--ckpt_path', type = str)
-    parser.add_argument('--sdxl_path', type = str)
+    parser.add_argument('--ckpt_path', type = str , default='./checkpoints/scale_factor_1.5.pth')
+    parser.add_argument('--sdxl_path', type = str, default='/root/shared-nvme/model/stable-diffusion-xl-base-1.0')
     parser.add_argument('--seed', type = int, default = 0)
     args = parser.parse_args()
     
@@ -63,7 +63,5 @@ if __name__ == "__main__":
                                                     use_safetensors=True, variant="fp16")
     pipe.to(device)
     
-    save_path = f"./results/V-A ({valence:.1f},{arousal:.1f}) | {prompt}.png"
+    save_path = f"./results/{prompt}_v{valence:.1f}_a{arousal:.1f}.png"
     emoticrafter(pipe,eit,prompt , a=arousal, v=valence, seed = args.seed).save(save_path)
-
-

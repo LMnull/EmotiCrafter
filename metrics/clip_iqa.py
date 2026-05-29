@@ -1,157 +1,186 @@
+import argparse
 from pathlib import Path
+from typing import List, Optional, Sequence, Union
 
-import torch
-import clip
 import numpy as np
-from PIL import Image
-from typing import Union, List, Tuple, Optional
+import torch
 import torch.nn.functional as F
+from PIL import Image
 
-# todo 数据输出格式修改为 “均值 ± 标准差”
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_IMAGE_DIR = PROJECT_ROOT / "results" / "val_prompt_5x5"
+DEFAULT_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-large-patch14")
+DEFAULT_LOG_PATH = PROJECT_ROOT / "log.txt"
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
 
 class CLIPIQA:
     """
-    CLIP-IQA: 基于CLIP的无参考图像质量评估
-    基于论文: "CLIP-IQA: Towards Blind Image Quality Assessment with CLIP"
+    CLIP-IQA style no-reference image quality score.
+
+    Scores are in the same 0-1 range as the original implementation in this repo.
     """
 
-    def __init__(self,
-                 model_name: str = "ViT-L/14",
-                 device: Optional[str] = None,
-                 use_soft_prompts: bool = True):
-        """
-        初始化CLIP-IQA
-
-        Args:
-            model_name: CLIP模型名称
-            device: 运行设备
-            use_soft_prompts: 是否使用软提示词增强
-        """
+    def __init__(
+        self,
+        model_path: Union[str, Path] = DEFAULT_MODEL_PATH,
+        device: Optional[str] = None,
+    ):
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
 
-        # 加载CLIP模型
-        self.model, self.preprocess = clip.load(model_name, device=self.device)
+        from transformers import CLIPModel, CLIPProcessor
+
+        self.model = CLIPModel.from_pretrained(str(model_path)).to(self.device)
+        self.processor = CLIPProcessor.from_pretrained(str(model_path))
         self.model.eval()
 
-        self.use_soft_prompts = use_soft_prompts
-
-        # 定义质量相关的提示词对
-        self.quality_prompts = {
-            'good': [
-                "good quality photo",
-                "high quality image",
-                "clear image",
-                "sharp photo",
-                "perfect quality",
-                "excellent image"
-            ],
-            'bad': [
-                "bad quality photo",
-                "low quality image",
-                "blurry image",
-                "noisy photo",
-                "poor quality",
-                "terrible image"
-            ]
-        }
-
-        # 更细粒度的质量维度
-        self.dimension_prompts = {
-            'sharpness': {
-                'good': ["sharp image", "clear details", "well-defined edges"],
-                'bad': ["blurry image", "fuzzy details", "unclear edges"]
-            },
-            'noise': {
-                'good': ["clean image", "noise-free photo", "smooth areas"],
-                'bad': ["noisy image", "grainy photo", "speckled image"]
-            },
-            'contrast': {
-                'good': ["good contrast", "vibrant image", "well-exposed"],
-                'bad': ["poor contrast", "washed out", "too dark or bright"]
-            },
-            'color': {
-                'good': ["natural colors", "vivid colors", "accurate color"],
-                'bad': ["color distortion", "unnatural colors", "color cast"]
-            }
-        }
-
-    def encode_text_prompts(self, prompts: List[str]) -> torch.Tensor:
-        """
-        编码文本提示词
-        """
-        text_tokens = clip.tokenize(prompts).to(self.device)
-        with torch.no_grad():
-            text_features = self.model.encode_text(text_tokens)
-            text_features = F.normalize(text_features, dim=-1)
-        return text_features
-
-    def encode_image(self, image: Union[str, Image.Image]) -> torch.Tensor:
-        """
-        编码单张图像
-        """
-        if isinstance(image, str):
-            image = Image.open(image).convert('RGB')
-        elif isinstance(image, np.ndarray):
-            image = Image.fromarray(image)
-
-        image_tensor = self.preprocess(image).unsqueeze(0).to(self.device)
-
-        with torch.no_grad():
-            image_features = self.model.encode_image(image_tensor)
-            image_features = F.normalize(image_features, dim=-1)
-
-        return image_features
-
-    def compute_quality_score(self,
-                              image: Union[str, Image.Image, torch.Tensor]) -> float:
-        """
-        计算图像质量分数
-
-        Args:
-            image: 输入图像
-            method: 计算方法
-                  'pair_comparison': 比较好坏提示词对的相似度
-                  'direct_regression': 直接回归到质量分数
-                  'ensemble': 集成多种方法
-        """
-        image_features = self.encode_image(image)
-        return self._direct_regression_score(image_features)
-
-    def _direct_regression_score(self, image_features: torch.Tensor) -> float:
-        """
-        直接回归到质量分数
-        """
-        # 使用质量锚点
-        quality_levels = [
+        self.quality_levels = [
             "excellent quality",
             "good quality",
             "fair quality",
             "poor quality",
-            "bad quality"
+            "bad quality",
         ]
+        self.quality_scores = torch.tensor([100, 75, 50, 25, 0], dtype=torch.float32, device=self.device)
+        self.anchor_features = self.encode_text_prompts(self.quality_levels)
 
-        # 质量分数映射
-        quality_scores = [100, 75, 50, 25, 0]
+    def encode_text_prompts(self, prompts: Sequence[str]) -> torch.Tensor:
+        inputs = self.processor(
+            text=list(prompts),
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
-        # 编码质量锚点
-        anchor_features = self.encode_text_prompts(quality_levels)
+        with torch.no_grad():
+            text_features = self.model.get_text_features(**inputs)
+            text_features = F.normalize(text_features, dim=-1)
+        return text_features
 
-        # 计算与各锚点的相似度
-        similarities = image_features @ anchor_features.T
+    def encode_images(self, images: Sequence[Union[str, Path, Image.Image]]) -> torch.Tensor:
+        pil_images = []
+        for image in images:
+            if isinstance(image, Image.Image):
+                pil_images.append(image.convert("RGB"))
+            else:
+                with Image.open(image) as opened_image:
+                    pil_images.append(opened_image.convert("RGB"))
 
-        # 加权平均得到质量分数
+        inputs = self.processor(images=pil_images, return_tensors="pt")
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+
+        with torch.no_grad():
+            image_features = self.model.get_image_features(**inputs)
+            image_features = F.normalize(image_features, dim=-1)
+        return image_features
+
+    def compute_quality_scores(self, images: Sequence[Union[str, Path, Image.Image]]) -> np.ndarray:
+        image_features = self.encode_images(images)
+        similarities = image_features @ self.anchor_features.T
         weights = F.softmax(similarities * 10, dim=-1)
-        weighted_score = (weights * torch.tensor(quality_scores).to(self.device)).sum()
+        scores = (weights * self.quality_scores).sum(dim=-1) / 100
+        return scores.detach().cpu().numpy()
 
-        return weighted_score.item() / 100
+    def compute_quality_score(self, image: Union[str, Path, Image.Image]) -> float:
+        return float(self.compute_quality_scores([image])[0])
 
 
-if __name__ == '__main__':
-    current_dir = Path(__file__).parent
-    image_path = current_dir.parent / 'results' / 'V-A (-2.0,-2.0) | A person is standing over the ocean.png'
-    clip_iqa = CLIPIQA()
-    result = clip_iqa.compute_quality_score(image_path)
-    print(result)
+def iter_image_paths(image_dir: Union[str, Path]) -> List[Path]:
+    image_dir = Path(image_dir)
+    return sorted(
+        image_path
+        for image_path in image_dir.iterdir()
+        if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+
+
+def chunked(items: Sequence[Path], batch_size: int):
+    for index in range(0, len(items), batch_size):
+        yield items[index:index + batch_size]
+
+
+def format_mean_std(values: Sequence[float]) -> str:
+    values = np.asarray(values, dtype=np.float64)
+    return f"{values.mean():.3f} \u00b1 {values.std(ddof=0):.3f}"
+
+
+def evaluate_directory(
+    image_dir: Union[str, Path],
+    model_path: Union[str, Path],
+    device: Optional[str],
+    batch_size: int,
+    limit: Optional[int] = None,
+) -> np.ndarray:
+    if batch_size < 1:
+        raise ValueError("batch_size must be greater than 0")
+
+    image_paths = iter_image_paths(image_dir)
+    if limit is not None:
+        image_paths = image_paths[:limit]
+    if not image_paths:
+        raise ValueError(f"No valid images found in {image_dir}")
+
+    metric = CLIPIQA(model_path=model_path, device=device)
+    all_scores: List[float] = []
+
+    for batch_index, batch in enumerate(chunked(image_paths, batch_size), start=1):
+        scores = metric.compute_quality_scores(batch)
+        all_scores.extend(float(score) for score in scores)
+        print(f"batch {batch_index}: processed {len(all_scores)}/{len(image_paths)}", flush=True)
+
+    return np.asarray(all_scores, dtype=np.float64)
+
+
+def write_log(
+    log_path: Union[str, Path],
+    scores: np.ndarray,
+    append: bool,
+):
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        f"CLIP-IQA: {format_mean_std(scores)}",
+        f"num_images: {len(scores)}",
+    ]
+    log_text = "\n".join(lines) + "\n"
+    if append and log_path.exists() and log_path.stat().st_size > 0:
+        log_text = "\n" + log_text
+    mode = "a" if append else "w"
+    with log_path.open(mode, encoding="utf-8") as file:
+        file.write(log_text)
+    print(log_text, end="")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image_dir", type=Path, default=DEFAULT_IMAGE_DIR)
+    parser.add_argument("--model_path", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--log_path", type=Path, default=DEFAULT_LOG_PATH)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--overwrite_log", action="store_true")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    scores = evaluate_directory(
+        image_dir=args.image_dir,
+        model_path=args.model_path,
+        device=args.device,
+        batch_size=args.batch_size,
+        limit=args.limit,
+    )
+    used_device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    write_log(
+        log_path=args.log_path,
+        scores=scores,
+        append=not args.overwrite_log,
+    )

@@ -1,0 +1,33 @@
+EmotiCrafter paper-gap diagnostics
+num_images: 3300
+input_dir: /root/shared-nvme/project/EmotiCrafter/results/val_prompt_5x5
+clip_model_path: /root/shared-nvme/model/clip-vit-large-patch14
+device: cuda
+
+CLIPScore overall: 19.4244 ± 4.4753 (n=3300)
+
+CLIPScore by valence:
+  v=-3: 17.7735 ± 4.4281 (n=660)
+  v=-1.5: 18.4034 ± 4.2804 (n=660)
+  v=0: 20.2673 ± 4.2236 (n=660)
+  v=1.5: 20.4492 ± 4.3453 (n=660)
+  v=3: 20.2288 ± 4.3949 (n=660)
+
+CLIPScore by arousal:
+  a=-3: 19.1225 ± 4.4003 (n=660)
+  a=-1.5: 19.6486 ± 4.5149 (n=660)
+  a=0: 19.9311 ± 4.3472 (n=660)
+  a=1.5: 19.5437 ± 4.4575 (n=660)
+  a=3: 18.8763 ± 4.5732 (n=660)
+
+CLIPScore by V-A grid:
+a\v	-3	-1.5	0	1.5	3
+-3	17.4337 ± 4.4914 (n=132)	17.8403 ± 4.0420 (n=132)	20.0262 ± 4.0098 (n=132)	20.3175 ± 4.3550 (n=132)	19.9949 ± 4.2139 (n=132)
+-1.5	17.9233 ± 4.3188 (n=132)	18.5536 ± 4.2832 (n=132)	20.6847 ± 4.0741 (n=132)	20.6923 ± 4.4202 (n=132)	20.3889 ± 4.6799 (n=132)
+0	18.2387 ± 4.2231 (n=132)	19.0462 ± 4.0665 (n=132)	21.0556 ± 4.0513 (n=132)	20.8600 ± 4.2710 (n=132)	20.4552 ± 4.4064 (n=132)
+1.5	17.8017 ± 4.3683 (n=132)	18.5259 ± 4.3219 (n=132)	20.3246 ± 4.2782 (n=132)	20.5275 ± 4.1484 (n=132)	20.5388 ± 4.4084 (n=132)
+3	17.4701 ± 4.6747 (n=132)	18.0508 ± 4.5626 (n=132)	19.2455 ± 4.4610 (n=132)	19.8489 ± 4.4546 (n=132)	19.7663 ± 4.1982 (n=132)
+
+CLIPScore neutral point (v=0, a=0): 21.0556 ± 4.0513 (n=132)
+
+Official CLIP-IQA skipped: pyiqa is not installed in this environment. Install pyiqa or run this script in the paper's evaluation environment.
