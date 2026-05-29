@@ -32,9 +32,9 @@ if __name__ == "__main__":
         emotional_prompt = item['Emotional_Prompt']
 
         with torch.no_grad():
-            (   prompt_embeds_ori, 
+            (   prompt_embeds_ori,
                 negative_prompt_embeds,
-                pooled_prompt_embeds_ori, 
+                pooled_prompt_embeds_ori,
                 negative_pooled_prompt_embeds,
             ) = pipe.encode_prompt(
                 prompt=[neural_prompt ],
@@ -50,9 +50,9 @@ if __name__ == "__main__":
                 negative_pooled_prompt_embeds=None,
             )
             
-            (  prompt_embeds, 
+            (  prompt_embeds,
                 negative_prompt_embeds,
-                pooled_prompt_embeds_ori, 
+                pooled_prompt_embeds,
                 negative_pooled_prompt_embeds,
             ) = pipe.encode_prompt(
                 prompt=[emotional_prompt],
@@ -73,9 +73,11 @@ if __name__ == "__main__":
         emotional_prompt_feature = prompt_embeds[0]
         res =   { 
                 'neutral_prompt_feature': neutral_prompt_feature.detach().cpu().to(torch.float16),
+                'neutral_pooled_prompt_feature': pooled_prompt_embeds_ori[0].detach().cpu().to(torch.float16),
                 'arousal': torch.tensor([arousal], dtype=torch.float),
                 'valence': torch.tensor([valence], dtype=torch.float),
-                'emotional_prompt_feature': emotional_prompt_feature.detach().cpu().to(torch.float16)
+                'emotional_prompt_feature': emotional_prompt_feature.detach().cpu().to(torch.float16),
+                'emotional_pooled_prompt_feature': pooled_prompt_embeds[0].detach().cpu().to(torch.float16)
                 }
         index+=1
         res_list.append(res)

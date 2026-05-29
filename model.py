@@ -121,12 +121,75 @@ class Cond_Block(GPT2Block):
         x = x + m
         outputs = (x,)
         return outputs
+
+
+class TokenEmotionGate(nn.Module):
+    """Predicts how much emotional residual each SDXL prompt token should receive."""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.condition_proj = nn.Linear(2, hidden_dim)
+        self.fc1 = nn.Linear(hidden_dim * 3, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, 1)
+        nn.init.constant_(self.fc2.bias, -1.0)
+
+    def forward(self, semantic_states, emotion_states, arousal, valence):
+        condition = torch.cat([arousal, valence], dim=-1)
+        condition = self.condition_proj(condition).unsqueeze(1).expand_as(semantic_states)
+        gate_input = torch.cat([semantic_states, emotion_states, condition], dim=-1)
+        return torch.sigmoid(self.fc2(self.act(self.fc1(gate_input))))
+
+
+class PooledEmotionAdapter(nn.Module):
+    """Emotion adapter for SDXL pooled_prompt_embeds, the global text condition."""
+
+    def __init__(self, pooled_feature_dim=1280):
+        super().__init__()
+        self.condition_proj = nn.Sequential(
+            nn.Linear(2, 256),
+            nn.GELU(),
+            nn.Linear(256, pooled_feature_dim),
+        )
+        self.delta = nn.Sequential(
+            nn.LayerNorm(pooled_feature_dim),
+            nn.Linear(pooled_feature_dim, pooled_feature_dim),
+            nn.GELU(),
+            nn.Linear(pooled_feature_dim, pooled_feature_dim),
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(pooled_feature_dim * 2, pooled_feature_dim),
+            nn.GELU(),
+            nn.Linear(pooled_feature_dim, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, pooled_prompt_embeds, arousal, valence):
+        condition = torch.cat([arousal, valence], dim=-1)
+        condition_feature = self.condition_proj(condition)
+        delta_input = pooled_prompt_embeds + condition_feature
+        delta = self.delta(delta_input)
+        gate = self.gate(torch.cat([pooled_prompt_embeds, condition_feature], dim=-1))
+        return pooled_prompt_embeds + gate * delta
     
 class EmotionInjectionTransformer(GPT2Model):
-    def __init__(self, config, final_out_type="Linear+LN",sd_feature_dim=2048):
+    def __init__(
+            self,
+            config,
+            final_out_type="DisentangledDualCondition",
+            sd_feature_dim=2048,
+            pooled_feature_dim=1280,
+            use_disentangled=True,
+            use_token_gate=True,
+            use_pooled_adapter=True,
+    ):
         super(GPT2Model, self).__init__(config)
         self.add_attn = True
         self.sd_feature_dim = sd_feature_dim
+        self.pooled_feature_dim = pooled_feature_dim
+        self.use_disentangled = use_disentangled
+        self.use_token_gate = use_token_gate
+        self.use_pooled_adapter = use_pooled_adapter
         self.activate_a = True 
         self.activate_v = True 
         self.output_hidden_states = config.output_hidden_states
@@ -138,7 +201,11 @@ class EmotionInjectionTransformer(GPT2Model):
         self.drop = nn.Dropout(config.embd_pdrop)
         self.xl_feature2gpt_feature = nn.Linear(self.sd_feature_dim,config.n_embd,bias=False)
         self.gpt_feature2xl_feature = nn.Linear(config.n_embd,self.sd_feature_dim,bias=False)
-        if final_out_type == "Linear+LN" or final_out_type=="Linear+LN+noResidual":
+        if (
+                final_out_type == "DisentangledDualCondition"
+                or final_out_type == "Linear+LN"
+                or final_out_type=="Linear+LN+noResidual"
+        ):
             self.ln_xl_feature = nn.LayerNorm(self.sd_feature_dim, eps=1e-5)
         elif final_out_type == "Linear+LN+Linear" or final_out_type=="Linear+LN+Linear+noResidual":
             self.ln_xl_feature = nn.LayerNorm(self.sd_feature_dim, eps=1e-5)
@@ -162,6 +229,22 @@ class EmotionInjectionTransformer(GPT2Model):
             self.h = nn.ModuleList([Cond_Block(config,self.activate_a,self.activate_v) for _ in range(config.n_layer)])
         else:
             self.h = nn.ModuleList([GPT2Block(config) for _ in range(config.n_layer)])
+        if self.use_disentangled:
+            self.semantic_h = nn.ModuleList([GPT2Block(config) for _ in range(config.n_layer)])
+            self.semantic_ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+            self.emotion_delta_proj = nn.Linear(config.n_embd, self.sd_feature_dim, bias=False)
+            self.emotion_delta_norm = nn.LayerNorm(self.sd_feature_dim, eps=1e-5)
+        else:
+            self.semantic_h = None
+            self.semantic_ln_f = None
+            self.emotion_delta_proj = None
+            self.emotion_delta_norm = None
+        self.token_gate = TokenEmotionGate(config.n_embd) if self.use_token_gate else None
+        self.pooled_adapter = (
+            PooledEmotionAdapter(self.pooled_feature_dim)
+            if self.use_pooled_adapter
+            else None
+        )
         self.final_out_type = final_out_type
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
     def forward(
@@ -173,6 +256,7 @@ class EmotionInjectionTransformer(GPT2Model):
             position_ids=None,
             head_mask=None,
             inputs_embeds=None,
+            pooled_prompt_embeds=None,
             arousal=None,
             valence=None,
     ):
@@ -189,6 +273,10 @@ class EmotionInjectionTransformer(GPT2Model):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         device = input_ids.device if input_ids is not None else inputs_embeds.device
+        if arousal is None or valence is None:
+            raise ValueError("arousal and valence must be provided for emotion injection")
+        arousal = arousal.to(device).to(torch.float32).view(batch_size, -1)[:, :1]
+        valence = valence.to(device).to(torch.float32).view(batch_size, -1)[:, :1]
 
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
@@ -206,6 +294,7 @@ class EmotionInjectionTransformer(GPT2Model):
         head_mask = self.get_head_mask(head_mask, self.config.n_layer)
 
         if inputs_embeds is None:
+            residual = None
             inputs_embeds = self.wte(input_ids)
         else:
             residual = inputs_embeds 
@@ -215,28 +304,47 @@ class EmotionInjectionTransformer(GPT2Model):
         hidden_states = inputs_embeds + position_embeds
 
         hidden_states = self.drop(hidden_states)
+        semantic_states = hidden_states if self.use_disentangled else None
         
         a_feature = self.attn_proj(self.a_f(arousal).view(-1, self.cross_token, self.config.n_embd) )
         v_feature = self.attn_proj(self.v_f(valence).view(-1, self.cross_token, self.config.n_embd) )
         
-        output_shape = input_shape + (hidden_states.size(-1),)
-
         all_self_attentions = () if self.output_attentions else None
         all_hidden_states = () if self.output_hidden_states else None
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
             if self.output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
+            if self.use_disentangled:
+                semantic_outputs = self.semantic_h[i](
+                    semantic_states,
+                    layer_past=layer_past,
+                    attention_mask=attention_mask,
+                    head_mask=head_mask[i],
+                    use_cache=False,
+                )
+                semantic_states = semantic_outputs[0]
             outputs = block(
                 hidden_states, a = a_feature,v = v_feature, layer_past=layer_past, attention_mask=attention_mask, head_mask=head_mask[i]
             )
             hidden_states = outputs[0]
-            if self.output_attentions:
+            if self.output_attentions and len(outputs) > 2:
                 all_self_attentions = all_self_attentions + (outputs[2 if self.use_cache else 1],)
 
         hidden_states = self.ln_f(hidden_states)
-        
-        
-        if self.final_out_type == "Linear+LN":
+
+        if self.use_disentangled:
+            semantic_states = self.semantic_ln_f(semantic_states)
+            semantic_feature = self.ln_xl_feature(self.gpt_feature2xl_feature(semantic_states))
+            if residual is not None:
+                semantic_feature = residual + semantic_feature
+
+            emotion_delta = self.emotion_delta_norm(self.emotion_delta_proj(hidden_states))
+            if self.token_gate is None:
+                gate = 1.0
+            else:
+                gate = self.token_gate(semantic_states, hidden_states, arousal, valence)
+            hidden_states = semantic_feature + gate * emotion_delta
+        elif self.final_out_type == "Linear+LN":
             hidden_states = residual+self.ln_xl_feature(self.gpt_feature2xl_feature(hidden_states))
         elif self.final_out_type == "Linear+LN+noResidual":
             hidden_states = self.ln_xl_feature(self.gpt_feature2xl_feature(hidden_states))
@@ -252,9 +360,13 @@ class EmotionInjectionTransformer(GPT2Model):
         if self.output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
         outputs = (hidden_states,)
+        if pooled_prompt_embeds is not None and self.pooled_adapter is not None:
+            pooled_prompt_embeds = pooled_prompt_embeds.to(device).to(torch.float32)
+            pooled_prompt_embeds = self.pooled_adapter(pooled_prompt_embeds, arousal, valence)
+            outputs = outputs + (pooled_prompt_embeds,)
         if self.output_hidden_states:
             outputs = outputs + (all_hidden_states,)
-        if self.output_attentions:
+        if self.output_attentions and all_self_attentions:
             attention_output_shape = input_shape[:-1] + (-1,) + all_self_attentions[0].shape[-2:]
             all_attentions = tuple(t.view(*attention_output_shape) for t in all_self_attentions)
             outputs = outputs + (all_attentions,)

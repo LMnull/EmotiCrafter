@@ -37,13 +37,30 @@ class EmotionDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        return {
+        sample = {
             'neutral_prompt_feature': item['neutral_prompt_feature'].to(self.device),
             'arousal': item['arousal'],
             'valence': item['valence'],
             'emotional_prompt_feature': item['emotional_prompt_feature'].to(self.device),
             'density': torch.FloatTensor([item['density']]).to(self.device),
         }
+        if 'neutral_pooled_prompt_feature' in item and 'emotional_pooled_prompt_feature' in item:
+            sample['neutral_pooled_prompt_feature'] = item['neutral_pooled_prompt_feature'].to(self.device)
+            sample['emotional_pooled_prompt_feature'] = item['emotional_pooled_prompt_feature'].to(self.device)
+        return sample
+
+
+def _scaled_target(source_feature, target_feature, alpha):
+    return (target_feature - source_feature) * alpha + source_feature
+
+
+def _mse_with_optional_density(criterion, prediction, target, density=None):
+    if density is None:
+        return criterion(prediction, target)
+    weight = 1 / density
+    while weight.dim() < prediction.dim():
+        weight = weight.unsqueeze(-1)
+    return criterion(prediction * weight, target * weight)
 
 def train(model, train_loader, optimizer, criterion, device, alpha=1.0, enable_density=False):
     model.train()
@@ -55,18 +72,35 @@ def train(model, train_loader, optimizer, criterion, device, alpha=1.0, enable_d
         valence = batch['valence'].to(device)
         emotional_prompt_feature = batch['emotional_prompt_feature'].to(device).to(torch.float32)
         density = batch['density'].to(device).to(torch.float32)
+        neutral_pooled_prompt_feature = batch.get('neutral_pooled_prompt_feature')
+        emotional_pooled_prompt_feature = batch.get('emotional_pooled_prompt_feature')
+        if neutral_pooled_prompt_feature is not None:
+            neutral_pooled_prompt_feature = neutral_pooled_prompt_feature.to(device).to(torch.float32)
+            emotional_pooled_prompt_feature = emotional_pooled_prompt_feature.to(device).to(torch.float32)
         optimizer.zero_grad()
-        predicted_emotional_prompt_feature = \
-            model(inputs_embeds=neutral_prompt_feature, arousal=arousal, valence=valence)[0]
-        if enable_density:
-            loss = criterion(
-                predicted_emotional_prompt_feature * 1 / density.unsqueeze(-1),
-                (1 / density.unsqueeze(-1)) * (
-                        (emotional_prompt_feature - neutral_prompt_feature) * alpha + neutral_prompt_feature))
-        else:
-            loss = criterion(
-                predicted_emotional_prompt_feature,
-                (emotional_prompt_feature - neutral_prompt_feature) * alpha + neutral_prompt_feature)
+        outputs = model(
+            inputs_embeds=neutral_prompt_feature,
+            pooled_prompt_embeds=neutral_pooled_prompt_feature,
+            arousal=arousal,
+            valence=valence,
+        )
+        predicted_emotional_prompt_feature = outputs[0]
+        token_target = _scaled_target(neutral_prompt_feature, emotional_prompt_feature, alpha)
+        loss = _mse_with_optional_density(
+            criterion,
+            predicted_emotional_prompt_feature,
+            token_target,
+            density if enable_density else None,
+        )
+        if neutral_pooled_prompt_feature is not None and len(outputs) > 1:
+            pooled_target = _scaled_target(neutral_pooled_prompt_feature, emotional_pooled_prompt_feature, alpha)
+            pooled_loss = _mse_with_optional_density(
+                criterion,
+                outputs[1],
+                pooled_target,
+                density if enable_density else None,
+            )
+            loss = loss + pooled_loss
         loss.backward()
         optimizer.step()
 
@@ -86,17 +120,48 @@ def evaluate(model, val_loader, criterion, device, alpha=1.0, enable_density=Fal
             valence = batch['valence'].to(device)
             emotional_prompt_feature = batch['emotional_prompt_feature'].to(device).to(torch.float32)
             density = batch['density'].to(device).to(torch.float32)
+            neutral_pooled_prompt_feature = batch.get('neutral_pooled_prompt_feature')
+            emotional_pooled_prompt_feature = batch.get('emotional_pooled_prompt_feature')
+            if neutral_pooled_prompt_feature is not None:
+                neutral_pooled_prompt_feature = neutral_pooled_prompt_feature.to(device).to(torch.float32)
+                emotional_pooled_prompt_feature = emotional_pooled_prompt_feature.to(device).to(torch.float32)
 
-            predicted_emotional_prompt_feature = \
-                model(inputs_embeds=neutral_prompt_feature, arousal=arousal, valence=valence)[0]
+            outputs = model(
+                inputs_embeds=neutral_prompt_feature,
+                pooled_prompt_embeds=neutral_pooled_prompt_feature,
+                arousal=arousal,
+                valence=valence,
+            )
+            predicted_emotional_prompt_feature = outputs[0]
+            token_target = _scaled_target(neutral_prompt_feature, emotional_prompt_feature, alpha)
             if enable_density:
-                loss_weight = criterion(
-                    predicted_emotional_prompt_feature * 1 / density.unsqueeze(-1),
-                    (1 / density.unsqueeze(-1)) * (
-                            (emotional_prompt_feature - neutral_prompt_feature) * alpha + neutral_prompt_feature))
+                loss_weight = _mse_with_optional_density(
+                    criterion,
+                    predicted_emotional_prompt_feature,
+                    token_target,
+                    density,
+                )
+                if neutral_pooled_prompt_feature is not None and len(outputs) > 1:
+                    pooled_target = _scaled_target(
+                        neutral_pooled_prompt_feature,
+                        emotional_pooled_prompt_feature,
+                        alpha,
+                    )
+                    loss_weight = loss_weight + _mse_with_optional_density(
+                        criterion,
+                        outputs[1],
+                        pooled_target,
+                        density,
+                    )
                 total_loss_weight += loss_weight.item()
-            loss = criterion(predicted_emotional_prompt_feature,
-                             (emotional_prompt_feature - neutral_prompt_feature) * alpha + neutral_prompt_feature)
+            loss = criterion(predicted_emotional_prompt_feature, token_target)
+            if neutral_pooled_prompt_feature is not None and len(outputs) > 1:
+                pooled_target = _scaled_target(
+                    neutral_pooled_prompt_feature,
+                    emotional_pooled_prompt_feature,
+                    alpha,
+                )
+                loss = loss + criterion(outputs[1], pooled_target)
 
             total_loss += loss.item()
     return total_loss / len(val_loader), total_loss_weight / len(val_loader)
@@ -146,7 +211,7 @@ def main():
     alpha = args.scale_factor
 
     config = GPT2Config.from_pretrained('./config')
-    model = EmotionInjectionTransformer(config, final_out_type="Linear+LN").to(device)
+    model = EmotionInjectionTransformer(config, final_out_type="DisentangledDualCondition").to(device)
     if n_gpu > 1:
         model = torch.nn.DataParallel(model)
     if args.load_model:
