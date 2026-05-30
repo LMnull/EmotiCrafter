@@ -10,14 +10,6 @@ from sklearn.neighbors import KernelDensity
 from model import EmotionInjectionTransformer
 import numpy as np
 
-
-def _emotion_scalar_for_density(t):
-    t = torch.as_tensor(t).float().flatten()
-    if t.numel() == 1:
-        return float(t.item())
-    return float(torch.argmax(t).item())
-
-
 def get_density(alist, vlist):
     data = np.vstack([alist.T[0], vlist.T[0]]).T
     kde = KernelDensity(kernel='gaussian', bandwidth="silverman")
@@ -107,10 +99,10 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
-    parser.add_argument('--load_model', type=str, default=None)
+    parser.add_argument('--load_model', type=str, default='/root/shared-nvme/model/stable-diffusion-xl-base-1.0')
     parser.add_argument('--device_cuda', type=str, default="0")
     parser.add_argument('--scale_factor', type=float, default=1.5)
-    parser.add_argument('--wandb_name', type=str, default="your experiment name")
+    parser.add_argument('--wandb_name', type=str, default="lfy_emotion")
     parser.add_argument('--enable_density', action='store_true', default=False)
     parser.add_argument('--data_cache_path', type=str, default="./data/data-cache.pt")
 
