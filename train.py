@@ -290,6 +290,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch_size", type=int, default=64, help="Global batch size across all GPUs.")
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--load_model", type=str, default=None)
@@ -377,7 +378,7 @@ def main():
         easa_tau_positive=args.easa_tau_positive,
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_val_loss = float("inf")
     best_val_emo_loss = float("inf")
