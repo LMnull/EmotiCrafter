@@ -106,12 +106,49 @@ def load_state_dict_flexible(model, checkpoint_path, device):
         state_dict = {key[len("module."):]: value for key, value in state_dict.items()}
     model.load_state_dict(state_dict)
 
-def train(model, train_loader, optimizer, criterion, device, alpha=1.0, enable_density=False, distributed=False, rank=0):
+
+def resolve_amp_dtype(amp_dtype, device, rank):
+    if device.type != 'cuda' or amp_dtype == 'none':
+        return None
+    if amp_dtype == 'bf16':
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        if is_main_process(rank):
+            print("bf16 is not supported on this GPU; falling back to fp16 AMP.")
+        return torch.float16
+    if amp_dtype == 'fp16':
+        return torch.float16
+    raise ValueError(f"Unsupported amp dtype: {amp_dtype}")
+
+
+def autocast_context(device, amp_dtype):
+    return torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None)
+
+
+def create_grad_scaler(amp_dtype):
+    return torch.cuda.amp.GradScaler(enabled=amp_dtype == torch.float16)
+
+
+def train(
+        model,
+        train_loader,
+        optimizer,
+        criterion,
+        device,
+        alpha=1.0,
+        enable_density=False,
+        distributed=False,
+        rank=0,
+        amp_dtype=None,
+        scaler=None,
+        grad_accum_steps=1,
+):
     model.train()
     total_loss = 0
     total_steps = 0
 
     iterator = tqdm(train_loader, desc="Training", disable=not is_main_process(rank))
+    optimizer.zero_grad(set_to_none=True)
     for batch in iterator:
         neutral_prompt_feature = batch['neutral_prompt_feature'].to(device, non_blocking=True).to(torch.float32)
         arousal = batch['arousal'].to(device, non_blocking=True)
@@ -123,32 +160,44 @@ def train(model, train_loader, optimizer, criterion, device, alpha=1.0, enable_d
         if neutral_pooled_prompt_feature is not None:
             neutral_pooled_prompt_feature = neutral_pooled_prompt_feature.to(device, non_blocking=True).to(torch.float32)
             emotional_pooled_prompt_feature = emotional_pooled_prompt_feature.to(device, non_blocking=True).to(torch.float32)
-        optimizer.zero_grad(set_to_none=True)
-        outputs = model(
-            inputs_embeds=neutral_prompt_feature,
-            pooled_prompt_embeds=neutral_pooled_prompt_feature,
-            arousal=arousal,
-            valence=valence,
-        )
-        predicted_emotional_prompt_feature = outputs[0]
-        token_target = _scaled_target(neutral_prompt_feature, emotional_prompt_feature, alpha)
-        loss = _mse_with_optional_density(
-            criterion,
-            predicted_emotional_prompt_feature,
-            token_target,
-            density if enable_density else None,
-        )
-        if neutral_pooled_prompt_feature is not None and len(outputs) > 1:
-            pooled_target = _scaled_target(neutral_pooled_prompt_feature, emotional_pooled_prompt_feature, alpha)
-            pooled_loss = _mse_with_optional_density(
+        with autocast_context(device, amp_dtype):
+            outputs = model(
+                inputs_embeds=neutral_prompt_feature,
+                pooled_prompt_embeds=neutral_pooled_prompt_feature,
+                arousal=arousal,
+                valence=valence,
+            )
+            predicted_emotional_prompt_feature = outputs[0]
+            token_target = _scaled_target(neutral_prompt_feature, emotional_prompt_feature, alpha)
+            loss = _mse_with_optional_density(
                 criterion,
-                outputs[1],
-                pooled_target,
+                predicted_emotional_prompt_feature,
+                token_target,
                 density if enable_density else None,
             )
-            loss = loss + pooled_loss
-        loss.backward()
-        optimizer.step()
+            if neutral_pooled_prompt_feature is not None and len(outputs) > 1:
+                pooled_target = _scaled_target(neutral_pooled_prompt_feature, emotional_pooled_prompt_feature, alpha)
+                pooled_loss = _mse_with_optional_density(
+                    criterion,
+                    outputs[1],
+                    pooled_target,
+                    density if enable_density else None,
+                )
+                loss = loss + pooled_loss
+        loss_to_backward = loss / grad_accum_steps
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss_to_backward).backward()
+        else:
+            loss_to_backward.backward()
+
+        should_step = (total_steps + 1) % grad_accum_steps == 0 or (total_steps + 1) == len(train_loader)
+        if should_step:
+            if scaler is not None and scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         total_loss += loss.item()
         total_steps += 1
@@ -156,7 +205,17 @@ def train(model, train_loader, optimizer, criterion, device, alpha=1.0, enable_d
     return reduce_average(total_loss, total_steps, device, distributed)
 
 
-def evaluate(model, val_loader, criterion, device, alpha=1.0, enable_density=False, distributed=False, rank=0):
+def evaluate(
+        model,
+        val_loader,
+        criterion,
+        device,
+        alpha=1.0,
+        enable_density=False,
+        distributed=False,
+        rank=0,
+        amp_dtype=None,
+):
     model.eval()
     total_loss = 0
     total_loss_weight = 0
@@ -176,43 +235,44 @@ def evaluate(model, val_loader, criterion, device, alpha=1.0, enable_density=Fal
                 neutral_pooled_prompt_feature = neutral_pooled_prompt_feature.to(device, non_blocking=True).to(torch.float32)
                 emotional_pooled_prompt_feature = emotional_pooled_prompt_feature.to(device, non_blocking=True).to(torch.float32)
 
-            outputs = model(
-                inputs_embeds=neutral_prompt_feature,
-                pooled_prompt_embeds=neutral_pooled_prompt_feature,
-                arousal=arousal,
-                valence=valence,
-            )
-            predicted_emotional_prompt_feature = outputs[0]
-            token_target = _scaled_target(neutral_prompt_feature, emotional_prompt_feature, alpha)
-            if enable_density:
-                loss_weight = _mse_with_optional_density(
-                    criterion,
-                    predicted_emotional_prompt_feature,
-                    token_target,
-                    density,
+            with autocast_context(device, amp_dtype):
+                outputs = model(
+                    inputs_embeds=neutral_prompt_feature,
+                    pooled_prompt_embeds=neutral_pooled_prompt_feature,
+                    arousal=arousal,
+                    valence=valence,
                 )
+                predicted_emotional_prompt_feature = outputs[0]
+                token_target = _scaled_target(neutral_prompt_feature, emotional_prompt_feature, alpha)
+                if enable_density:
+                    loss_weight = _mse_with_optional_density(
+                        criterion,
+                        predicted_emotional_prompt_feature,
+                        token_target,
+                        density,
+                    )
+                    if neutral_pooled_prompt_feature is not None and len(outputs) > 1:
+                        pooled_target = _scaled_target(
+                            neutral_pooled_prompt_feature,
+                            emotional_pooled_prompt_feature,
+                            alpha,
+                        )
+                        loss_weight = loss_weight + _mse_with_optional_density(
+                            criterion,
+                            outputs[1],
+                            pooled_target,
+                            density,
+                        )
+                    total_loss_weight += loss_weight.item()
+                    total_weight_steps += 1
+                loss = criterion(predicted_emotional_prompt_feature, token_target)
                 if neutral_pooled_prompt_feature is not None and len(outputs) > 1:
                     pooled_target = _scaled_target(
                         neutral_pooled_prompt_feature,
                         emotional_pooled_prompt_feature,
                         alpha,
                     )
-                    loss_weight = loss_weight + _mse_with_optional_density(
-                        criterion,
-                        outputs[1],
-                        pooled_target,
-                        density,
-                    )
-                total_loss_weight += loss_weight.item()
-                total_weight_steps += 1
-            loss = criterion(predicted_emotional_prompt_feature, token_target)
-            if neutral_pooled_prompt_feature is not None and len(outputs) > 1:
-                pooled_target = _scaled_target(
-                    neutral_pooled_prompt_feature,
-                    emotional_pooled_prompt_feature,
-                    alpha,
-                )
-                loss = loss + criterion(outputs[1], pooled_target)
+                    loss = loss + criterion(outputs[1], pooled_target)
 
             total_loss += loss.item()
             total_steps += 1
@@ -223,7 +283,7 @@ def evaluate(model, val_loader, criterion, device, alpha=1.0, enable_density=Fal
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--batch_size', type=int, default=1024, help='Per-GPU batch size when launched with torchrun/DDP.')
+    parser.add_argument('--batch_size', type=int, default=64, help='Per-GPU micro-batch size when launched with torchrun/DDP.')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
@@ -234,9 +294,15 @@ def main():
     parser.add_argument('--use_wandb', action='store_true', default=False)
     parser.add_argument('--enable_density', action='store_true', default=False)
     parser.add_argument('--data_cache_path', type=str, default="./data/data-cache.pt")
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=2)
+    parser.add_argument('--grad_accum_steps', type=int, default=8)
+    parser.add_argument('--amp_dtype', type=str, default='bf16', choices=['bf16', 'fp16', 'none'])
 
     args = parser.parse_args()
+    if args.batch_size < 1:
+        raise ValueError("--batch_size must be greater than 0")
+    if args.grad_accum_steps < 1:
+        raise ValueError("--grad_accum_steps must be greater than 0")
 
     distributed, local_rank, rank, world_size = setup_distributed()
     main_process = is_main_process(rank)
@@ -247,6 +313,7 @@ def main():
         device = torch.device('cpu')
     if distributed and not torch.cuda.is_available():
         raise RuntimeError("Distributed training requires CUDA devices.")
+    amp_dtype = resolve_amp_dtype(args.amp_dtype, device, rank)
 
     use_wandb = args.use_wandb and main_process
     if use_wandb:
@@ -254,6 +321,11 @@ def main():
     if main_process:
         print(f"args\n{args}")
         print(f"distributed={distributed}, world_size={world_size}, device={device}")
+        effective_batch = args.batch_size * world_size * args.grad_accum_steps
+        print(
+            f"micro_batch_per_gpu={args.batch_size}, grad_accum_steps={args.grad_accum_steps}, "
+            f"effective_batch_size={effective_batch}, amp_dtype={args.amp_dtype}"
+        )
 
     data = torch.load(args.data_cache_path, map_location='cpu')
 
@@ -314,6 +386,7 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     criterion = torch.nn.MSELoss()
+    scaler = create_grad_scaler(amp_dtype)
 
     best_val_loss = float('inf')
     best_model_path = os.path.join(args.save_dir, 'best_model.pth')
@@ -338,6 +411,9 @@ def main():
                 enable_density=args.enable_density,
                 distributed=distributed,
                 rank=rank,
+                amp_dtype=amp_dtype,
+                scaler=scaler,
+                grad_accum_steps=args.grad_accum_steps,
             )
             val_loss, val_loss_weight = evaluate(
                 model,
@@ -348,6 +424,7 @@ def main():
                 args.enable_density,
                 distributed=distributed,
                 rank=rank,
+                amp_dtype=amp_dtype,
             )
             if use_wandb:
                 wandb.log({
