@@ -54,6 +54,16 @@ def load_model_state(model, ckpt_path, device):
     checkpoint = torch.load(ckpt_path, map_location=device)
     unwrap_model(model).load_state_dict(normalize_state_dict(checkpoint))
 
+def validate_input_file(path, arg_name, expected_description):
+    if os.path.isdir(path):
+        raise SystemExit(
+            f"{arg_name} expects {expected_description}, but got a directory: {path}\n"
+            "For training data, use --data_cache_path ./data/data-cache.pt after running preprocess.py. "
+            "For resuming EIT training, use --load_model checkpoints/best_model.pth."
+        )
+    if not os.path.isfile(path):
+        raise SystemExit(f"{arg_name} does not exist or is not a file: {path}")
+
 def batch_to_device(batch, device, non_blocking=False):
     return {
         key: value.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
@@ -143,6 +153,7 @@ def main():
         print(f"Using device: {device}")
     
     
+    validate_input_file(args.data_cache_path, "--data_cache_path", "a preprocessed .pt data cache file")
     data = torch.load(args.data_cache_path, map_location="cpu")
     
     alist,vlist = np.array([item['arousal'] for item in data]),np.array([item['valence'] for item in data])
@@ -175,6 +186,7 @@ def main():
     if n_gpu > 1:
         model = torch.nn.DataParallel(model, device_ids=list(range(n_gpu)))
     if args.load_model:
+        validate_input_file(args.load_model, "--load_model", "an EIT .pth checkpoint file")
         load_model_state(model, args.load_model, device)
     model.to(device)
     
