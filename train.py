@@ -23,33 +23,56 @@ def get_density(alist, vlist):
 
 
 class EmotionDataset(Dataset):
-    def __init__(self, data, device):
+    def __init__(self, data):
         self.data = data
-        self.device = device
     def __len__(self):
         return len(self.data)
     def __getitem__(self, idx):
         item = self.data[idx]
         cap = item["caption"]
         return {
-            'neutral_prompt_feature': item['neutral_prompt_feature'].to(self.device),
-            'arousal': item['arousal'],
-            'valence': item['valence'],
-            'emotional_prompt_feature': item['emotional_prompt_feature'].to(self.device),
-            'density': torch.FloatTensor([item['density']]).to(self.device),
+            'neutral_prompt_feature': torch.as_tensor(item['neutral_prompt_feature'], dtype=torch.float32),
+            'arousal': torch.as_tensor(item['arousal'], dtype=torch.float32).reshape(1),
+            'valence': torch.as_tensor(item['valence'], dtype=torch.float32).reshape(1),
+            'emotional_prompt_feature': torch.as_tensor(item['emotional_prompt_feature'], dtype=torch.float32),
+            'density': torch.as_tensor([item['density']], dtype=torch.float32),
         }
+
+def unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+def normalize_state_dict(state_dict):
+    if isinstance(state_dict, dict) and "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    if not isinstance(state_dict, dict):
+        raise TypeError("Checkpoint must be a state_dict or contain a 'state_dict' entry.")
+    if any(key.startswith("module.") for key in state_dict):
+        return {key.removeprefix("module."): value for key, value in state_dict.items()}
+    return state_dict
+
+def load_model_state(model, ckpt_path, device):
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    unwrap_model(model).load_state_dict(normalize_state_dict(checkpoint))
+
+def batch_to_device(batch, device, non_blocking=False):
+    return {
+        key: value.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+        for key, value in batch.items()
+    }
 
 def train(model, train_loader, optimizer, criterion, device,alpha=1.0,enable_density = False):
     model.train()
     total_loss = 0
+    non_blocking = device.type == "cuda"
     
     for batch in tqdm(train_loader, desc="Training"):
-        neutral_prompt_feature = batch['neutral_prompt_feature'].to(device).to(torch.float32)
-        arousal = batch['arousal'].to(device)
-        valence = batch['valence'].to(device)
-        emotional_prompt_feature = batch['emotional_prompt_feature'].to(device).to(torch.float32)
-        density = batch['density'].to(device).to(torch.float32)
-        optimizer.zero_grad()
+        batch = batch_to_device(batch, device, non_blocking=non_blocking)
+        neutral_prompt_feature = batch['neutral_prompt_feature']
+        arousal = batch['arousal']
+        valence = batch['valence']
+        emotional_prompt_feature = batch['emotional_prompt_feature']
+        density = batch['density']
+        optimizer.zero_grad(set_to_none=True)
         predicted_emotional_prompt_feature = model(inputs_embeds=neutral_prompt_feature, arousal=arousal, valence=valence)[0]
         if enable_density:
             loss = criterion(
@@ -69,13 +92,15 @@ def evaluate(model, val_loader, criterion, device,alpha=1.0,enable_density = Fal
     model.eval()
     total_loss = 0
     total_loss_weight = 0
+    non_blocking = device.type == "cuda"
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Evaluating"):
-            neutral_prompt_feature = batch['neutral_prompt_feature'].to(device).to(torch.float32)
-            arousal = batch['arousal'].to(device)
-            valence = batch['valence'].to(device)
-            emotional_prompt_feature = batch['emotional_prompt_feature'].to(device).to(torch.float32)
-            density = batch['density'].to(device).to(torch.float32)
+            batch = batch_to_device(batch, device, non_blocking=non_blocking)
+            neutral_prompt_feature = batch['neutral_prompt_feature']
+            arousal = batch['arousal']
+            valence = batch['valence']
+            emotional_prompt_feature = batch['emotional_prompt_feature']
+            density = batch['density']
             
             predicted_emotional_prompt_feature = model(inputs_embeds=neutral_prompt_feature, arousal=arousal, valence=valence)[0]
             if enable_density:
@@ -95,22 +120,30 @@ def main():
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--load_model', type=str, default=None)
-    parser.add_argument('--device_cuda', type=str, default="0")
+    parser.add_argument('--device_cuda', type=str, default="0,1")
     parser.add_argument('--scale_factor', type=float, default=1.0)
     parser.add_argument('--wandb_name', type=str, default="your experiment name")
     parser.add_argument('--enable_density',type=bool,default=False)
     parser.add_argument('--data_cache_path',type=str,default="./data/data-cache.pt")
+    parser.add_argument('--num_workers', type=int, default=4)
     args = parser.parse_args()
     
+    if args.device_cuda and args.device_cuda.lower() not in {"all", "auto"}:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.device_cuda
+
     use_wandb = False
     if use_wandb:
         wandb.init(project="emoticrafter", name=f"{args.wandb_name}", config=vars(args))
     print(f"args\n{args}")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    n_gpu = torch.cuda.device_count()
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    n_gpu = torch.cuda.device_count() if device.type == "cuda" else 0
+    if n_gpu > 1:
+        print(f"Using DataParallel on {n_gpu} visible CUDA devices.")
+    else:
+        print(f"Using device: {device}")
     
     
-    data = torch.load(args.data_cache_path)
+    data = torch.load(args.data_cache_path, map_location="cpu")
     
     alist,vlist = np.array([item['arousal'] for item in data]),np.array([item['valence'] for item in data])
     h = 1
@@ -123,10 +156,16 @@ def main():
 
 
     train_data, val_data = train_test_split(data, test_size=0.01, random_state=42)
-    train_dataset = EmotionDataset(train_data, device)
-    val_dataset = EmotionDataset(val_data, device)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    train_dataset = EmotionDataset(train_data)
+    val_dataset = EmotionDataset(val_data)
+    loader_kwargs = {
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
     
     alpha = args.scale_factor
     
@@ -134,9 +173,9 @@ def main():
     config = GPT2Config.from_pretrained('./config')
     model = EmotionInjectionTransformer(config,final_out_type="Linear+LN").to(device)
     if n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+        model = torch.nn.DataParallel(model, device_ids=list(range(n_gpu)))
     if args.load_model:
-        model.load_state_dict(torch.load(args.load_model))
+        load_model_state(model, args.load_model, device)
     model.to(device)
     
 
@@ -168,17 +207,17 @@ def main():
         if not os.path.exists(args.save_dir):
             os.makedirs(args.save_dir)
         if (epoch + 1) % 50 == 0:
-            torch.save(model.state_dict(), os.path.join(args.save_dir, f'model_epoch_{epoch+1}.pth'))
+            torch.save(unwrap_model(model).state_dict(), os.path.join(args.save_dir, f'model_epoch_{epoch+1}.pth'))
         
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), best_model_path)
+            torch.save(unwrap_model(model).state_dict(), best_model_path)
             print(f"New best model saved with validation loss: {best_val_loss:.4f}")
         if  args.enable_density:
             if val_loss_weight < best_val_loss_weight:
                 best_val_loss_weight = val_loss_weight
-                torch.save(model.state_dict(), best_model_path_weight)
+                torch.save(unwrap_model(model).state_dict(), best_model_path_weight)
                 print(f"New best model saved with weighted validation loss: {best_val_loss_weight:.4f}")
     if use_wandb:
         wandb.finish()
