@@ -10,7 +10,7 @@ import os
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--sdxl_path', type = str)
+    parser.add_argument('--sdxl_path', type = str, default = '/root/shared-nvme/model/stable-diffusion-xl-base-1.0')
     parser.add_argument('--csv_path', type = str, default = './data/prompt_mapping.csv')
     parser.add_argument('--data_cache_path', type = str, default = "./data/data-cache.pt")
     args = parser.parse_args()

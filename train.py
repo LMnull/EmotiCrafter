@@ -230,7 +230,7 @@ def main():
     parser.add_argument('--load_model', type=str, default=None)
     parser.add_argument('--device_cuda', type=str, default="0")
     parser.add_argument('--scale_factor', type=float, default=1.5)
-    parser.add_argument('--wandb_name', type=str, default="your experiment name")
+    parser.add_argument('--wandb_name', type=str, default="lfy_emotion")
     parser.add_argument('--use_wandb', action='store_true', default=False)
     parser.add_argument('--enable_density', action='store_true', default=False)
     parser.add_argument('--data_cache_path', type=str, default="./data/data-cache.pt")
