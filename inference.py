@@ -1,9 +1,30 @@
 import argparse
+import inspect
 import torch
 from diffusers import StableDiffusionXLPipeline
 from transformers import GPT2Config
 
 from model import EmotionInjectionTransformer
+
+
+def emotion_transformer_kwargs(enable_easa, easa_hidden_dim, easa_init_bias):
+    signature = inspect.signature(EmotionInjectionTransformer.__init__)
+    supported_args = signature.parameters
+    kwargs = {"final_out_type": "Linear+LN"}
+    if "use_easa" not in supported_args:
+        if enable_easa:
+            raise TypeError(
+                "This model.py does not support EASA. Please use the updated model.py "
+                "or run inference without --enable_easa for non-EASA checkpoints."
+            )
+        return kwargs
+
+    kwargs["use_easa"] = enable_easa
+    if "easa_hidden_dim" in supported_args:
+        kwargs["easa_hidden_dim"] = easa_hidden_dim
+    if "easa_init_bias" in supported_args:
+        kwargs["easa_init_bias"] = easa_init_bias
+    return kwargs
 
 
 def emoticrafter(pipe,eit, prompt,a = 0, v = 0, device = "cuda", seed = 42 ):
@@ -58,13 +79,12 @@ if __name__ == "__main__":
     sdxl_path = args.sdxl_path
 
     config = GPT2Config.from_pretrained('./config')
-    eit = EmotionInjectionTransformer(
-        config,
-        final_out_type="Linear+LN",
-        use_easa=args.enable_easa,
+    model_kwargs = emotion_transformer_kwargs(
+        enable_easa=args.enable_easa,
         easa_hidden_dim=args.easa_hidden_dim,
         easa_init_bias=args.easa_init_bias,
-    ).to(device)
+    )
+    eit = EmotionInjectionTransformer(config, **model_kwargs).to(device)
     eit = torch.nn.DataParallel(eit)
     ckpt = torch.load(ckpt_path, map_location=device)
     eit.load_state_dict(ckpt)

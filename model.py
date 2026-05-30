@@ -294,12 +294,12 @@ class EmotionInjectionTransformer(GPT2Model):
 
     def _predict_easa_lambda(self, neutral_feature, valence, arousal):
         flat_feature = neutral_feature.to(torch.float32).flatten(start_dim=1)
-        feature_norm = flat_feature.norm(dim=1, keepdim=True) / (flat_feature.shape[1] ** 0.5)
-        feature_var = flat_feature.var(dim=1, keepdim=True, unbiased=False)
+        feature_norm = torch.log1p(flat_feature.norm(dim=1, keepdim=True) / (flat_feature.shape[1] ** 0.5))
+        feature_var = torch.log1p(flat_feature.var(dim=1, keepdim=True, unbiased=False).clamp_min(0.0))
         gate_input = torch.cat(
             [
-                valence.to(torch.float32).view(-1, 1),
-                arousal.to(torch.float32).view(-1, 1),
+                valence.to(torch.float32).view(-1, 1) / 3.0,
+                arousal.to(torch.float32).view(-1, 1) / 3.0,
                 feature_norm,
                 feature_var,
             ],

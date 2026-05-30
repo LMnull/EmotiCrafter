@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import multiprocessing as mp
 import queue
@@ -51,6 +52,26 @@ def normalize_state_dict_for_model(state_dict, model_is_parallel):
     return state_dict
 
 
+def emotion_transformer_kwargs(EmotionInjectionTransformer, enable_easa, easa_hidden_dim, easa_init_bias):
+    signature = inspect.signature(EmotionInjectionTransformer.__init__)
+    supported_args = signature.parameters
+    kwargs = {"final_out_type": "Linear+LN"}
+    if "use_easa" not in supported_args:
+        if enable_easa:
+            raise TypeError(
+                "This model.py does not support EASA. Please use the updated model.py "
+                "or run inference without --enable_easa for non-EASA checkpoints."
+            )
+        return kwargs
+
+    kwargs["use_easa"] = enable_easa
+    if "easa_hidden_dim" in supported_args:
+        kwargs["easa_hidden_dim"] = easa_hidden_dim
+    if "easa_init_bias" in supported_args:
+        kwargs["easa_init_bias"] = easa_init_bias
+    return kwargs
+
+
 def load_eit(
     ckpt_path,
     device,
@@ -65,13 +86,13 @@ def load_eit(
     from model import EmotionInjectionTransformer
 
     config = GPT2Config.from_pretrained("./config")
-    eit = EmotionInjectionTransformer(
-        config,
-        final_out_type="Linear+LN",
-        use_easa=enable_easa,
+    model_kwargs = emotion_transformer_kwargs(
+        EmotionInjectionTransformer,
+        enable_easa=enable_easa,
         easa_hidden_dim=easa_hidden_dim,
         easa_init_bias=easa_init_bias,
-    ).to(device)
+    )
+    eit = EmotionInjectionTransformer(config, **model_kwargs).to(device)
     if data_parallel:
         eit = torch.nn.DataParallel(eit)
 

@@ -1,6 +1,6 @@
 import argparse
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -93,6 +93,7 @@ class LossConfig:
     enable_easa: bool
     easa_anchor_weight: float
     easa_smooth_weight: float
+    easa_lambda_reg_weight: float
     easa_tau_negative: float
     easa_tau_positive: float
 
@@ -147,12 +148,41 @@ def lambda_smoothness_loss(
         reference = valence if easa_lambda is None else easa_lambda
         return reference.new_tensor(0.0)
 
-    lambda_values = easa_lambda.view(-1)
     va_values = torch.cat([valence.view(-1, 1), arousal.view(-1, 1)], dim=1)
-    lambda_diff = lambda_values - lambda_values.roll(shifts=1, dims=0)
-    va_diff = va_values - va_values.roll(shifts=1, dims=0)
-    va_distance = va_diff.pow(2).sum(dim=1).clamp_min(1e-6)
-    return (lambda_diff.pow(2) / va_distance).mean()
+    sort_key = va_values[:, 0] * 10.0 + va_values[:, 1]
+    order = torch.argsort(sort_key)
+    lambda_values = easa_lambda.view(-1)[order]
+    va_values = va_values[order]
+    lambda_diff = lambda_values[1:] - lambda_values[:-1]
+    va_distance = (va_values[1:] - va_values[:-1]).pow(2).sum(dim=1)
+    valid = va_distance > 1e-6
+    if not torch.any(valid):
+        return lambda_values.new_tensor(0.0)
+    return (lambda_diff[valid].pow(2) / va_distance[valid].clamp_min(1e-6)).mean()
+
+
+def lambda_regularization_loss(
+    easa_lambda: Optional[torch.Tensor],
+    valence: torch.Tensor,
+) -> torch.Tensor:
+    if easa_lambda is None:
+        return valence.new_tensor(0.0)
+
+    valence_scaled = (valence.view(-1) / 3.0).clamp(min=-1.0, max=1.0)
+    target_lambda = 0.75 + 0.20 * valence_scaled
+    return F.mse_loss(easa_lambda.view(-1), target_lambda)
+
+
+def with_easa_loss_warmup(config: LossConfig, epoch: int, warmup_epochs: int) -> LossConfig:
+    if not config.enable_easa or warmup_epochs <= 0:
+        return config
+    scale = min(1.0, float(epoch + 1) / float(warmup_epochs))
+    return replace(
+        config,
+        easa_anchor_weight=config.easa_anchor_weight * scale,
+        easa_smooth_weight=config.easa_smooth_weight * scale,
+        easa_lambda_reg_weight=config.easa_lambda_reg_weight * scale,
+    )
 
 
 def compute_losses(
@@ -173,6 +203,7 @@ def compute_losses(
     loss_emo = emotion_loss(prediction, target, batch["density"], config)
     loss_anchor = prediction.new_tensor(0.0)
     loss_smooth = prediction.new_tensor(0.0)
+    loss_lambda_reg = prediction.new_tensor(0.0)
 
     if config.enable_easa and config.easa_anchor_weight > 0:
         loss_anchor = semantic_anchor_loss(
@@ -188,11 +219,17 @@ def compute_losses(
             valence=batch["valence"],
             arousal=batch["arousal"],
         )
+    if config.enable_easa and config.easa_lambda_reg_weight > 0:
+        loss_lambda_reg = lambda_regularization_loss(
+            easa_lambda=easa_lambda,
+            valence=batch["valence"],
+        )
 
     total_loss = (
         loss_emo
         + config.easa_anchor_weight * loss_anchor
         + config.easa_smooth_weight * loss_smooth
+        + config.easa_lambda_reg_weight * loss_lambda_reg
     )
 
     lambda_mean = float("nan")
@@ -209,6 +246,7 @@ def compute_losses(
         "loss_emo": loss_emo.item(),
         "loss_anchor": loss_anchor.item(),
         "loss_smooth": loss_smooth.item(),
+        "loss_lambda_reg": loss_lambda_reg.item(),
         "lambda_mean": lambda_mean,
         "lambda_min": lambda_min,
         "lambda_max": lambda_max,
@@ -225,7 +263,14 @@ def accumulate_metrics(metric_sums: Dict[str, float], metrics: Dict[str, float],
             metric_sums[key] = metric_sums.get(key, 0.0) + value * batch_size
 
 
-def train_one_epoch(model, train_loader, optimizer, device, config: LossConfig) -> Dict[str, float]:
+def train_one_epoch(
+    model,
+    train_loader,
+    optimizer,
+    device,
+    config: LossConfig,
+    max_grad_norm: float,
+) -> Dict[str, float]:
     model.train()
     metric_sums: Dict[str, float] = {}
     total_count = 0
@@ -236,6 +281,8 @@ def train_one_epoch(model, train_loader, optimizer, device, config: LossConfig) 
         optimizer.zero_grad(set_to_none=True)
         loss, metrics = compute_losses(model, batch, config)
         loss.backward()
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
 
         accumulate_metrics(metric_sums, metrics, batch_size)
@@ -308,10 +355,13 @@ def parse_args():
     parser.add_argument("--enable_easa", action="store_true")
     parser.add_argument("--easa_hidden_dim", type=int, default=64)
     parser.add_argument("--easa_init_bias", type=float, default=2.0)
-    parser.add_argument("--easa_anchor_weight", type=float, default=0.1)
-    parser.add_argument("--easa_smooth_weight", type=float, default=0.01)
+    parser.add_argument("--easa_anchor_weight", type=float, default=0.02)
+    parser.add_argument("--easa_smooth_weight", type=float, default=0.001)
+    parser.add_argument("--easa_lambda_reg_weight", type=float, default=0.01)
+    parser.add_argument("--easa_loss_warmup_epochs", type=int, default=10)
     parser.add_argument("--easa_tau_negative", type=float, default=0.95)
     parser.add_argument("--easa_tau_positive", type=float, default=0.85)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -374,6 +424,7 @@ def main():
         enable_easa=args.enable_easa,
         easa_anchor_weight=args.easa_anchor_weight,
         easa_smooth_weight=args.easa_smooth_weight,
+        easa_lambda_reg_weight=args.easa_lambda_reg_weight,
         easa_tau_negative=args.easa_tau_negative,
         easa_tau_positive=args.easa_tau_positive,
     )
@@ -389,8 +440,16 @@ def main():
     print("Preparation Done!")
 
     for epoch in range(args.epochs):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, loss_config)
-        val_metrics = evaluate(model, val_loader, device, loss_config)
+        epoch_loss_config = with_easa_loss_warmup(loss_config, epoch, args.easa_loss_warmup_epochs)
+        train_metrics = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch_loss_config,
+            max_grad_norm=args.max_grad_norm,
+        )
+        val_metrics = evaluate(model, val_loader, device, epoch_loss_config)
 
         if args.use_wandb:
             wandb.log({
