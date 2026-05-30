@@ -58,8 +58,10 @@ def validate_input_file(path, arg_name, expected_description):
     if os.path.isdir(path):
         raise SystemExit(
             f"{arg_name} expects {expected_description}, but got a directory: {path}\n"
+            "The SDXL base model directory is used by preprocess.py/inference*.py, not train.py. "
             "For training data, use --data_cache_path ./data/data-cache.pt after running preprocess.py. "
-            "For resuming EIT training, use --load_model checkpoints/best_model.pth."
+            "For resuming EIT training, use --load_model checkpoints/best_model.pth; "
+            "otherwise omit --load_model."
         )
     if not os.path.isfile(path):
         raise SystemExit(f"{arg_name} does not exist or is not a file: {path}")
@@ -129,12 +131,22 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
-    parser.add_argument('--load_model', type=str, default=None)
+    parser.add_argument(
+        '--load_model',
+        type=str,
+        default=None,
+        help='Optional EIT checkpoint .pth file for resuming training; do not pass the SDXL model directory.',
+    )
     parser.add_argument('--device_cuda', type=str, default="0,1")
     parser.add_argument('--scale_factor', type=float, default=1.0)
     parser.add_argument('--wandb_name', type=str, default="your experiment name")
     parser.add_argument('--enable_density',type=bool,default=False)
-    parser.add_argument('--data_cache_path',type=str,default="./data/data-cache.pt")
+    parser.add_argument(
+        '--data_cache_path',
+        type=str,
+        default="./data/data-cache.pt",
+        help='Preprocessed training cache produced by preprocess.py.',
+    )
     parser.add_argument('--num_workers', type=int, default=4)
     args = parser.parse_args()
     
