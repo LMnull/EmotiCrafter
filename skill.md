@@ -100,7 +100,7 @@ Training command template:
 python train.py \
   --data_cache_path ./data/data-cache.pt \
   --save_dir ./checkpoints/experiment_name \
-  --batch_size 1024 \
+  --batch_size 64 \
   --lr 1e-4 \
   --epochs 200 \
   --scale_factor 1.0
