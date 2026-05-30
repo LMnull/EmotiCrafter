@@ -29,7 +29,6 @@ class EmotionDataset(Dataset):
         return len(self.data)
     def __getitem__(self, idx):
         item = self.data[idx]
-        cap = item["caption"]
         return {
             'neutral_prompt_feature': torch.as_tensor(item['neutral_prompt_feature'], dtype=torch.float32),
             'arousal': torch.as_tensor(item['arousal'], dtype=torch.float32).reshape(1),
