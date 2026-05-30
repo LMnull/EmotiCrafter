@@ -283,7 +283,7 @@ def evaluate(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--batch_size', type=int, default=64, help='Per-GPU micro-batch size when launched with torchrun/DDP.')
+    parser.add_argument('--batch_size', type=int, default=16, help='Per-GPU micro-batch size when launched with torchrun/DDP.')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
@@ -295,8 +295,9 @@ def main():
     parser.add_argument('--enable_density', action='store_true', default=False)
     parser.add_argument('--data_cache_path', type=str, default="./data/data-cache.pt")
     parser.add_argument('--num_workers', type=int, default=2)
-    parser.add_argument('--grad_accum_steps', type=int, default=8)
+    parser.add_argument('--grad_accum_steps', type=int, default=32)
     parser.add_argument('--amp_dtype', type=str, default='bf16', choices=['bf16', 'fp16', 'none'])
+    parser.add_argument('--disable_activation_checkpointing', action='store_true', default=False)
 
     args = parser.parse_args()
     if args.batch_size < 1:
@@ -324,7 +325,8 @@ def main():
         effective_batch = args.batch_size * world_size * args.grad_accum_steps
         print(
             f"micro_batch_per_gpu={args.batch_size}, grad_accum_steps={args.grad_accum_steps}, "
-            f"effective_batch_size={effective_batch}, amp_dtype={args.amp_dtype}"
+            f"effective_batch_size={effective_batch}, amp_dtype={args.amp_dtype}, "
+            f"activation_checkpointing={not args.disable_activation_checkpointing}"
         )
 
     data = torch.load(args.data_cache_path, map_location='cpu')
@@ -373,7 +375,11 @@ def main():
     alpha = args.scale_factor
 
     config = GPT2Config.from_pretrained('./config')
-    model = EmotionInjectionTransformer(config, final_out_type="DisentangledDualCondition").to(device)
+    model = EmotionInjectionTransformer(
+        config,
+        final_out_type="DisentangledDualCondition",
+        activation_checkpointing=not args.disable_activation_checkpointing,
+    ).to(device)
     if args.load_model:
         load_state_dict_flexible(model, args.load_model, device)
     if distributed:
