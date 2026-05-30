@@ -22,17 +22,10 @@ def emoticrafter(pipe,eit, prompt,a = 0, v = 0, device = "cuda", seed = 42 ):
         negative_pooled_prompt_embeds=None,
     )
     resolution= int(1024)
-    out = eit(
-        inputs_embeds=prompt_embeds_ori.to(torch.float32),
-        pooled_prompt_embeds=pooled_prompt_embeds_ori.to(torch.float32),
-        arousal=torch.FloatTensor([[a]]).to(device),
-        valence=torch.FloatTensor([[v]]).to(device),
-    )
-    prompt_embeds = out[0].to(torch.float16)
-    pooled_prompt_embeds = out[1].to(torch.float16) if len(out) > 1 else pooled_prompt_embeds_ori
+    out = eit(inputs_embeds = prompt_embeds_ori.to(torch.float32),arousal=torch.FloatTensor([[a]]).to(device),valence=torch.FloatTensor([[v]]).to(device))
     image =pipe(
-        prompt_embeds = prompt_embeds,
-        pooled_prompt_embeds = pooled_prompt_embeds,
+        prompt_embeds = out[0].to(torch.float16),
+        pooled_prompt_embeds =pooled_prompt_embeds_ori,
         guidance_scale=7.5,
         num_inference_steps=25,
         height=resolution,
@@ -59,7 +52,7 @@ if __name__ == "__main__":
     sdxl_path = args.sdxl_path
 
     config = GPT2Config.from_pretrained('./config')
-    eit = EmotionInjectionTransformer(config,final_out_type="DisentangledDualCondition").to(device)
+    eit = EmotionInjectionTransformer(config,final_out_type="Linear+LN").to(device)
     eit = torch.nn.DataParallel(eit)
     ckpt = torch.load(ckpt_path)
     eit.load_state_dict(ckpt)

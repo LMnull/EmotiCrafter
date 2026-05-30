@@ -39,7 +39,7 @@ def load_eit(ckpt_path, device):
     from model import EmotionInjectionTransformer
 
     config = GPT2Config.from_pretrained("./config")
-    eit = EmotionInjectionTransformer(config, final_out_type="DisentangledDualCondition").to(device)
+    eit = EmotionInjectionTransformer(config, final_out_type="Linear+LN").to(device)
     eit = torch.nn.DataParallel(eit)
     ckpt = torch.load(ckpt_path, map_location=device)
     eit.load_state_dict(ckpt)
