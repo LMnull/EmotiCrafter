@@ -123,9 +123,18 @@ class Cond_Block(GPT2Block):
         return outputs
     
 class EmotionInjectionTransformer(GPT2Model):
-    def __init__(self, config, final_out_type="Linear+LN",sd_feature_dim=2048):
+    def __init__(
+            self,
+            config,
+            final_out_type="Linear+LN",
+            sd_feature_dim=2048,
+            use_easa=False,
+            easa_hidden_dim=64,
+            easa_init_bias=2.0,
+    ):
         super(GPT2Model, self).__init__(config)
         self.add_attn = True
+        self.use_easa = use_easa
         self.sd_feature_dim = sd_feature_dim
         self.activate_a = True 
         self.activate_v = True 
@@ -146,6 +155,14 @@ class EmotionInjectionTransformer(GPT2Model):
         else:
             raise NotImplementedError
         self.init_weights()
+        if self.use_easa:
+            self.easa_gate = nn.Sequential(
+                nn.Linear(4, easa_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(easa_hidden_dim, 1),
+            )
+            nn.init.normal_(self.easa_gate[-1].weight, mean=0.0, std=1e-3)
+            nn.init.constant_(self.easa_gate[-1].bias, easa_init_bias)
         self.cross_token = 16
         self.a_f = nn.Sequential(
             nn.Linear(1, 256),
@@ -175,6 +192,7 @@ class EmotionInjectionTransformer(GPT2Model):
             inputs_embeds=None,
             arousal=None,
             valence=None,
+            return_easa_lambda=False,
     ):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -236,18 +254,22 @@ class EmotionInjectionTransformer(GPT2Model):
         hidden_states = self.ln_f(hidden_states)
         
         
+        easa_lambda = None
         if self.final_out_type == "Linear+LN":
-            hidden_states = residual+self.ln_xl_feature(self.gpt_feature2xl_feature(hidden_states))
+            delta = self.ln_xl_feature(self.gpt_feature2xl_feature(hidden_states))
+            hidden_states, easa_lambda = self._apply_easa(residual, delta, valence, arousal)
         elif self.final_out_type == "Linear+LN+noResidual":
             hidden_states = self.ln_xl_feature(self.gpt_feature2xl_feature(hidden_states))
         elif self.final_out_type == "Linear+LN+Linear":
-            hidden_states = residual+self.ff(self.ln_xl_feature(self.gpt_feature2xl_feature(hidden_states)))
+            delta = self.ff(self.ln_xl_feature(self.gpt_feature2xl_feature(hidden_states)))
+            hidden_states, easa_lambda = self._apply_easa(residual, delta, valence, arousal)
         elif self.final_out_type == "Linear+LN+Linear+noResidual":
             hidden_states = self.ff(self.ln_xl_feature(self.gpt_feature2xl_feature(hidden_states)))
         elif self.final_out_type == "Linear+noResidual":
             hidden_states = self.gpt_feature2xl_feature(hidden_states)
         else:
-            hidden_states = residual+self.gpt_feature2xl_feature(hidden_states)
+            delta = self.gpt_feature2xl_feature(hidden_states)
+            hidden_states, easa_lambda = self._apply_easa(residual, delta, valence, arousal)
             
         if self.output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -258,5 +280,29 @@ class EmotionInjectionTransformer(GPT2Model):
             attention_output_shape = input_shape[:-1] + (-1,) + all_self_attentions[0].shape[-2:]
             all_attentions = tuple(t.view(*attention_output_shape) for t in all_self_attentions)
             outputs = outputs + (all_attentions,)
+        if return_easa_lambda:
+            outputs = outputs + (easa_lambda,)
 
         return outputs
+
+    def _apply_easa(self, neutral_feature, delta_feature, valence, arousal):
+        if not self.use_easa:
+            return neutral_feature + delta_feature, None
+
+        easa_lambda = self._predict_easa_lambda(neutral_feature, valence, arousal)
+        return neutral_feature + easa_lambda.view(-1, 1, 1) * delta_feature, easa_lambda
+
+    def _predict_easa_lambda(self, neutral_feature, valence, arousal):
+        flat_feature = neutral_feature.to(torch.float32).flatten(start_dim=1)
+        feature_norm = flat_feature.norm(dim=1, keepdim=True) / (flat_feature.shape[1] ** 0.5)
+        feature_var = flat_feature.var(dim=1, keepdim=True, unbiased=False)
+        gate_input = torch.cat(
+            [
+                valence.to(torch.float32).view(-1, 1),
+                arousal.to(torch.float32).view(-1, 1),
+                feature_norm,
+                feature_var,
+            ],
+            dim=1,
+        )
+        return torch.sigmoid(self.easa_gate(gate_input))

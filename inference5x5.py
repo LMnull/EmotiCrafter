@@ -32,14 +32,20 @@ def load_prompts(prompt_json):
     return prompts
 
 
-def load_eit(ckpt_path, device):
+def load_eit(ckpt_path, device, enable_easa=False, easa_hidden_dim=64, easa_init_bias=2.0):
     import torch
     from transformers import GPT2Config
 
     from model import EmotionInjectionTransformer
 
     config = GPT2Config.from_pretrained("./config")
-    eit = EmotionInjectionTransformer(config, final_out_type="Linear+LN").to(device)
+    eit = EmotionInjectionTransformer(
+        config,
+        final_out_type="Linear+LN",
+        use_easa=enable_easa,
+        easa_hidden_dim=easa_hidden_dim,
+        easa_init_bias=easa_init_bias,
+    ).to(device)
     eit = torch.nn.DataParallel(eit)
     ckpt = torch.load(ckpt_path, map_location=device)
     eit.load_state_dict(ckpt)
@@ -111,6 +117,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--enable_easa", action="store_true")
+    parser.add_argument("--easa_hidden_dim", type=int, default=64)
+    parser.add_argument("--easa_init_bias", type=float, default=2.0)
     return parser.parse_args()
 
 
@@ -126,7 +135,13 @@ if __name__ == "__main__":
         if not torch.cuda.is_available():
             raise SystemExit("CUDA was requested but is not available in this environment.")
 
-    eit = load_eit(args.ckpt_path, args.device)
+    eit = load_eit(
+        args.ckpt_path,
+        args.device,
+        enable_easa=args.enable_easa,
+        easa_hidden_dim=args.easa_hidden_dim,
+        easa_init_bias=args.easa_init_bias,
+    )
     pipe = load_pipe(args.sdxl_path, args.device)
 
     total = len(prompts) * len(VALENCES) * len(AROUSALS)

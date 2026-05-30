@@ -1,8 +1,11 @@
-from transformers import GPT2Config
-from model import  EmotionInjectionTransformer
-from diffusers import StableDiffusionXLPipeline
-import torch
 import argparse
+import torch
+from diffusers import StableDiffusionXLPipeline
+from transformers import GPT2Config
+
+from model import EmotionInjectionTransformer
+
+
 def emoticrafter(pipe,eit, prompt,a = 0, v = 0, device = "cuda", seed = 42 ):
     (   prompt_embeds_ori, 
         negative_prompt_embeds,
@@ -43,6 +46,9 @@ if __name__ == "__main__":
     parser.add_argument('--ckpt_path', type = str , default='./checkpoints/scale_factor_1.5.pth')
     parser.add_argument('--sdxl_path', type = str, default='/root/shared-nvme/model/stable-diffusion-xl-base-1.0')
     parser.add_argument('--seed', type = int, default = 0)
+    parser.add_argument('--enable_easa', action='store_true')
+    parser.add_argument('--easa_hidden_dim', type=int, default=64)
+    parser.add_argument('--easa_init_bias', type=float, default=2.0)
     args = parser.parse_args()
     
     prompt, arousal, valence = args.prompt, args.arousal, args.valence
@@ -52,9 +58,15 @@ if __name__ == "__main__":
     sdxl_path = args.sdxl_path
 
     config = GPT2Config.from_pretrained('./config')
-    eit = EmotionInjectionTransformer(config,final_out_type="Linear+LN").to(device)
+    eit = EmotionInjectionTransformer(
+        config,
+        final_out_type="Linear+LN",
+        use_easa=args.enable_easa,
+        easa_hidden_dim=args.easa_hidden_dim,
+        easa_init_bias=args.easa_init_bias,
+    ).to(device)
     eit = torch.nn.DataParallel(eit)
-    ckpt = torch.load(ckpt_path)
+    ckpt = torch.load(ckpt_path, map_location=device)
     eit.load_state_dict(ckpt)
     eit.eval()
     eit.to(device)
