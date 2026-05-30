@@ -1,5 +1,8 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from transformers import GPT2Config
 import wandb
 import argparse
@@ -28,9 +31,8 @@ def get_density(alist, vlist):
 
 
 class EmotionDataset(Dataset):
-    def __init__(self, data, device):
+    def __init__(self, data):
         self.data = data
-        self.device = device
 
     def __len__(self):
         return len(self.data)
@@ -38,15 +40,15 @@ class EmotionDataset(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]
         sample = {
-            'neutral_prompt_feature': item['neutral_prompt_feature'].to(self.device),
+            'neutral_prompt_feature': item['neutral_prompt_feature'],
             'arousal': item['arousal'],
             'valence': item['valence'],
-            'emotional_prompt_feature': item['emotional_prompt_feature'].to(self.device),
-            'density': torch.FloatTensor([item['density']]).to(self.device),
+            'emotional_prompt_feature': item['emotional_prompt_feature'],
+            'density': torch.FloatTensor([item['density']]),
         }
         if 'neutral_pooled_prompt_feature' in item and 'emotional_pooled_prompt_feature' in item:
-            sample['neutral_pooled_prompt_feature'] = item['neutral_pooled_prompt_feature'].to(self.device)
-            sample['emotional_pooled_prompt_feature'] = item['emotional_pooled_prompt_feature'].to(self.device)
+            sample['neutral_pooled_prompt_feature'] = item['neutral_pooled_prompt_feature']
+            sample['emotional_pooled_prompt_feature'] = item['emotional_pooled_prompt_feature']
         return sample
 
 
@@ -62,22 +64,66 @@ def _mse_with_optional_density(criterion, prediction, target, density=None):
         weight = weight.unsqueeze(-1)
     return criterion(prediction * weight, target * weight)
 
-def train(model, train_loader, optimizer, criterion, device, alpha=1.0, enable_density=False):
+
+def setup_distributed():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    if not distributed:
+        return False, 0, 0, 1
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return True, local_rank, rank, world_size
+
+
+def cleanup_distributed(distributed):
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(rank):
+    return rank == 0
+
+
+def reduce_average(total_loss, total_steps, device, distributed):
+    stats = torch.tensor([total_loss, total_steps], dtype=torch.float64, device=device)
+    if distributed:
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    if stats[1].item() == 0:
+        return 0.0
+    return (stats[0] / stats[1]).item()
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def load_state_dict_flexible(model, checkpoint_path, device):
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    if all(key.startswith("module.") for key in state_dict.keys()):
+        state_dict = {key[len("module."):]: value for key, value in state_dict.items()}
+    model.load_state_dict(state_dict)
+
+def train(model, train_loader, optimizer, criterion, device, alpha=1.0, enable_density=False, distributed=False, rank=0):
     model.train()
     total_loss = 0
+    total_steps = 0
 
-    for batch in tqdm(train_loader, desc="Training"):
-        neutral_prompt_feature = batch['neutral_prompt_feature'].to(device).to(torch.float32)
-        arousal = batch['arousal'].to(device)
-        valence = batch['valence'].to(device)
-        emotional_prompt_feature = batch['emotional_prompt_feature'].to(device).to(torch.float32)
-        density = batch['density'].to(device).to(torch.float32)
+    iterator = tqdm(train_loader, desc="Training", disable=not is_main_process(rank))
+    for batch in iterator:
+        neutral_prompt_feature = batch['neutral_prompt_feature'].to(device, non_blocking=True).to(torch.float32)
+        arousal = batch['arousal'].to(device, non_blocking=True)
+        valence = batch['valence'].to(device, non_blocking=True)
+        emotional_prompt_feature = batch['emotional_prompt_feature'].to(device, non_blocking=True).to(torch.float32)
+        density = batch['density'].to(device, non_blocking=True).to(torch.float32)
         neutral_pooled_prompt_feature = batch.get('neutral_pooled_prompt_feature')
         emotional_pooled_prompt_feature = batch.get('emotional_pooled_prompt_feature')
         if neutral_pooled_prompt_feature is not None:
-            neutral_pooled_prompt_feature = neutral_pooled_prompt_feature.to(device).to(torch.float32)
-            emotional_pooled_prompt_feature = emotional_pooled_prompt_feature.to(device).to(torch.float32)
-        optimizer.zero_grad()
+            neutral_pooled_prompt_feature = neutral_pooled_prompt_feature.to(device, non_blocking=True).to(torch.float32)
+            emotional_pooled_prompt_feature = emotional_pooled_prompt_feature.to(device, non_blocking=True).to(torch.float32)
+        optimizer.zero_grad(set_to_none=True)
         outputs = model(
             inputs_embeds=neutral_prompt_feature,
             pooled_prompt_embeds=neutral_pooled_prompt_feature,
@@ -105,26 +151,30 @@ def train(model, train_loader, optimizer, criterion, device, alpha=1.0, enable_d
         optimizer.step()
 
         total_loss += loss.item()
+        total_steps += 1
 
-    return total_loss / len(train_loader)
+    return reduce_average(total_loss, total_steps, device, distributed)
 
 
-def evaluate(model, val_loader, criterion, device, alpha=1.0, enable_density=False):
+def evaluate(model, val_loader, criterion, device, alpha=1.0, enable_density=False, distributed=False, rank=0):
     model.eval()
     total_loss = 0
     total_loss_weight = 0
+    total_steps = 0
+    total_weight_steps = 0
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Evaluating"):
-            neutral_prompt_feature = batch['neutral_prompt_feature'].to(device).to(torch.float32)
-            arousal = batch['arousal'].to(device)
-            valence = batch['valence'].to(device)
-            emotional_prompt_feature = batch['emotional_prompt_feature'].to(device).to(torch.float32)
-            density = batch['density'].to(device).to(torch.float32)
+        iterator = tqdm(val_loader, desc="Evaluating", disable=not is_main_process(rank))
+        for batch in iterator:
+            neutral_prompt_feature = batch['neutral_prompt_feature'].to(device, non_blocking=True).to(torch.float32)
+            arousal = batch['arousal'].to(device, non_blocking=True)
+            valence = batch['valence'].to(device, non_blocking=True)
+            emotional_prompt_feature = batch['emotional_prompt_feature'].to(device, non_blocking=True).to(torch.float32)
+            density = batch['density'].to(device, non_blocking=True).to(torch.float32)
             neutral_pooled_prompt_feature = batch.get('neutral_pooled_prompt_feature')
             emotional_pooled_prompt_feature = batch.get('emotional_pooled_prompt_feature')
             if neutral_pooled_prompt_feature is not None:
-                neutral_pooled_prompt_feature = neutral_pooled_prompt_feature.to(device).to(torch.float32)
-                emotional_pooled_prompt_feature = emotional_pooled_prompt_feature.to(device).to(torch.float32)
+                neutral_pooled_prompt_feature = neutral_pooled_prompt_feature.to(device, non_blocking=True).to(torch.float32)
+                emotional_pooled_prompt_feature = emotional_pooled_prompt_feature.to(device, non_blocking=True).to(torch.float32)
 
             outputs = model(
                 inputs_embeds=neutral_prompt_feature,
@@ -154,6 +204,7 @@ def evaluate(model, val_loader, criterion, device, alpha=1.0, enable_density=Fal
                         density,
                     )
                 total_loss_weight += loss_weight.item()
+                total_weight_steps += 1
             loss = criterion(predicted_emotional_prompt_feature, token_target)
             if neutral_pooled_prompt_feature is not None and len(outputs) > 1:
                 pooled_target = _scaled_target(
@@ -164,11 +215,15 @@ def evaluate(model, val_loader, criterion, device, alpha=1.0, enable_density=Fal
                 loss = loss + criterion(outputs[1], pooled_target)
 
             total_loss += loss.item()
-    return total_loss / len(val_loader), total_loss_weight / len(val_loader)
+            total_steps += 1
+    return (
+        reduce_average(total_loss, total_steps, device, distributed),
+        reduce_average(total_loss_weight, total_weight_steps, device, distributed),
+    )
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--batch_size', type=int, default=1024, help='Per-GPU batch size when launched with torchrun/DDP.')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
@@ -176,19 +231,31 @@ def main():
     parser.add_argument('--device_cuda', type=str, default="0")
     parser.add_argument('--scale_factor', type=float, default=1.5)
     parser.add_argument('--wandb_name', type=str, default="your experiment name")
+    parser.add_argument('--use_wandb', action='store_true', default=False)
     parser.add_argument('--enable_density', action='store_true', default=False)
     parser.add_argument('--data_cache_path', type=str, default="./data/data-cache.pt")
+    parser.add_argument('--num_workers', type=int, default=4)
 
     args = parser.parse_args()
 
-    use_wandb = False
+    distributed, local_rank, rank, world_size = setup_distributed()
+    main_process = is_main_process(rank)
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}" if distributed else f"cuda:{args.device_cuda}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device('cpu')
+    if distributed and not torch.cuda.is_available():
+        raise RuntimeError("Distributed training requires CUDA devices.")
+
+    use_wandb = args.use_wandb and main_process
     if use_wandb:
         wandb.init(project="emoticrafter", name=f"{args.wandb_name}", config=vars(args))
-    print(f"args\n{args}")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    n_gpu = torch.cuda.device_count()
+    if main_process:
+        print(f"args\n{args}")
+        print(f"distributed={distributed}, world_size={world_size}, device={device}")
 
-    data = torch.load(args.data_cache_path)
+    data = torch.load(args.data_cache_path, map_location='cpu')
 
     alist = np.array([[_emotion_scalar_for_density(item['arousal'])] for item in data])
     vlist = np.array([[_emotion_scalar_for_density(item['valence'])] for item in data])
@@ -198,25 +265,52 @@ def main():
         data[index]['density'] = den_list[index]
 
     train_data, val_data = train_test_split(data, test_size=0.01, random_state=42)
-    train_dataset = EmotionDataset(train_data, device)
-    val_dataset = EmotionDataset(val_data, device)
+    train_dataset = EmotionDataset(train_data)
+    val_dataset = EmotionDataset(val_data)
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        drop_last=False,
+    ) if distributed else None
+    val_sampler = DistributedSampler(
+        val_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False,
+        drop_last=False,
+    ) if distributed else None
+    pin_memory = device.type == 'cuda'
     train_loader = DataLoader(train_dataset,
                               batch_size=args.batch_size,
-                              shuffle=True)
+                              shuffle=train_sampler is None,
+                              sampler=train_sampler,
+                              num_workers=args.num_workers,
+                              pin_memory=pin_memory,
+                              persistent_workers=args.num_workers > 0)
     val_loader = DataLoader(val_dataset,
                             batch_size=args.batch_size,
-                            shuffle=False
+                            shuffle=False,
+                            sampler=val_sampler,
+                            num_workers=args.num_workers,
+                            pin_memory=pin_memory,
+                            persistent_workers=args.num_workers > 0
                             )
 
     alpha = args.scale_factor
 
     config = GPT2Config.from_pretrained('./config')
     model = EmotionInjectionTransformer(config, final_out_type="DisentangledDualCondition").to(device)
-    if n_gpu > 1:
-        model = torch.nn.DataParallel(model)
     if args.load_model:
-        model.load_state_dict(torch.load(args.load_model))
-    model.to(device)
+        load_state_dict_flexible(model, args.load_model, device)
+    if distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     criterion = torch.nn.MSELoss()
@@ -227,40 +321,69 @@ def main():
     if args.enable_density:
         best_val_loss_weight = float('inf')
 
-    print("Preparation Done!")
+    if main_process:
+        print("Preparation Done!")
 
-    for epoch in range(args.epochs):
-        train_loss = train(model, train_loader, optimizer, criterion, device, alpha, enable_density=args.enable_density)
-        val_loss, val_loss_weight = evaluate(model, val_loader, criterion, device, alpha, args.enable_density)
+    try:
+        for epoch in range(args.epochs):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            train_loss = train(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+                alpha,
+                enable_density=args.enable_density,
+                distributed=distributed,
+                rank=rank,
+            )
+            val_loss, val_loss_weight = evaluate(
+                model,
+                val_loader,
+                criterion,
+                device,
+                alpha,
+                args.enable_density,
+                distributed=distributed,
+                rank=rank,
+            )
+            if use_wandb:
+                wandb.log({
+                    'epoch': epoch,
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'val_loss_weight': val_loss_weight
+                })
+
+            if main_process:
+                print(
+                    f"Epoch {epoch + 1}/{args.epochs}, Train Loss: {train_loss:.4f}, "
+                    f"Val Loss: {val_loss:.4f}, Val loss weight: {val_loss_weight:.4f}"
+                )
+
+                # Save model
+                if not os.path.exists(args.save_dir):
+                    os.makedirs(args.save_dir)
+                state_dict = unwrap_model(model).state_dict()
+                if (epoch + 1) % 50 == 0:
+                    torch.save(state_dict, os.path.join(args.save_dir, f'model_epoch_{epoch + 1}.pth'))
+
+                # Save best model
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    torch.save(state_dict, best_model_path)
+                    print(f"New best model saved with validation loss: {best_val_loss:.4f}")
+                if args.enable_density:
+                    if val_loss_weight < best_val_loss_weight:
+                        best_val_loss_weight = val_loss_weight
+                        torch.save(state_dict, best_model_path_weight)
+                        print(f"New best model saved with weighted validation loss: {best_val_loss_weight:.4f}")
+    finally:
         if use_wandb:
-            wandb.log({
-                'epoch': epoch,
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-                'val_loss_weight': val_loss_weight
-            })
-
-        print(
-            f"Epoch {epoch + 1}/{args.epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val loss weight: {val_loss_weight:.4f}")
-
-        # Save model
-        if not os.path.exists(args.save_dir):
-            os.makedirs(args.save_dir)
-        if (epoch + 1) % 50 == 0:
-            torch.save(model.state_dict(), os.path.join(args.save_dir, f'model_epoch_{epoch + 1}.pth'))
-
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), best_model_path)
-            print(f"New best model saved with validation loss: {best_val_loss:.4f}")
-        if args.enable_density:
-            if val_loss_weight < best_val_loss_weight:
-                best_val_loss_weight = val_loss_weight
-                torch.save(model.state_dict(), best_model_path_weight)
-                print(f"New best model saved with weighted validation loss: {best_val_loss_weight:.4f}")
-    if use_wandb:
-        wandb.finish()
+            wandb.finish()
+        cleanup_distributed(distributed)
 
 
 if __name__ == '__main__':
