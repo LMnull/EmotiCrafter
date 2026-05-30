@@ -1,5 +1,4 @@
 import torch
-from torch.utils.checkpoint import checkpoint
 from transformers import GPT2Model, GPT2Config
 from transformers.modeling_utils import PreTrainedModel, Conv1D, prune_conv1d_layer, SequenceSummary
 from transformers.models.gpt2.modeling_gpt2 import (
@@ -183,7 +182,6 @@ class EmotionInjectionTransformer(GPT2Model):
             use_disentangled=True,
             use_token_gate=True,
             use_pooled_adapter=True,
-            activation_checkpointing=True,
     ):
         super(GPT2Model, self).__init__(config)
         self.add_attn = True
@@ -192,7 +190,6 @@ class EmotionInjectionTransformer(GPT2Model):
         self.use_disentangled = use_disentangled
         self.use_token_gate = use_token_gate
         self.use_pooled_adapter = use_pooled_adapter
-        self.activation_checkpointing = activation_checkpointing
         self.activate_a = True 
         self.activate_v = True 
         self.output_hidden_states = config.output_hidden_states
@@ -250,15 +247,6 @@ class EmotionInjectionTransformer(GPT2Model):
         )
         self.final_out_type = final_out_type
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
-
-    def _should_checkpoint(self):
-        return (
-            self.activation_checkpointing
-            and self.training
-            and not self.output_hidden_states
-            and not self.output_attentions
-        )
-
     def forward(
             self,
             input_ids=None,
@@ -323,52 +311,22 @@ class EmotionInjectionTransformer(GPT2Model):
         
         all_self_attentions = () if self.output_attentions else None
         all_hidden_states = () if self.output_hidden_states else None
-        should_checkpoint = self._should_checkpoint()
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
-            layer_head_mask = head_mask[i]
             if self.output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
             if self.use_disentangled:
-                if should_checkpoint:
-                    semantic_block = self.semantic_h[i]
-
-                    def semantic_forward(states, semantic_block=semantic_block, layer_head_mask=layer_head_mask):
-                        return semantic_block(
-                            states,
-                            layer_past=None,
-                            attention_mask=attention_mask,
-                            head_mask=layer_head_mask,
-                            use_cache=False,
-                        )[0]
-
-                    semantic_states = checkpoint(semantic_forward, semantic_states, use_reentrant=False)
-                else:
-                    semantic_outputs = self.semantic_h[i](
-                        semantic_states,
-                        layer_past=layer_past,
-                        attention_mask=attention_mask,
-                        head_mask=head_mask[i],
-                        use_cache=False,
-                    )
-                    semantic_states = semantic_outputs[0]
-            if should_checkpoint:
-                def emotion_forward(states, a_states, v_states, block=block, layer_head_mask=layer_head_mask):
-                    return block(
-                        states,
-                        a=a_states,
-                        v=v_states,
-                        layer_past=None,
-                        attention_mask=attention_mask,
-                        head_mask=layer_head_mask,
-                    )[0]
-
-                hidden_states = checkpoint(emotion_forward, hidden_states, a_feature, v_feature, use_reentrant=False)
-                outputs = (hidden_states,)
-            else:
-                outputs = block(
-                    hidden_states, a = a_feature,v = v_feature, layer_past=layer_past, attention_mask=attention_mask, head_mask=layer_head_mask
+                semantic_outputs = self.semantic_h[i](
+                    semantic_states,
+                    layer_past=layer_past,
+                    attention_mask=attention_mask,
+                    head_mask=head_mask[i],
+                    use_cache=False,
                 )
-                hidden_states = outputs[0]
+                semantic_states = semantic_outputs[0]
+            outputs = block(
+                hidden_states, a = a_feature,v = v_feature, layer_past=layer_past, attention_mask=attention_mask, head_mask=head_mask[i]
+            )
+            hidden_states = outputs[0]
             if self.output_attentions and len(outputs) > 2:
                 all_self_attentions = all_self_attentions + (outputs[2 if self.use_cache else 1],)
 
