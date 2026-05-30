@@ -1,86 +1,100 @@
-# 迭代式指标提升 Skill
+# Iterative Metric Improvement Skill
 
-## 目标
+## Purpose
 
-使用本 Skill 对当前仓库中的 Python 实验代码进行闭环优化：
-先分析代码，提出一个明确创新点，修改相关 `.py` 文件，执行训练、推理或评估代码，
-记录每一次指标，并与前一个最好方法对比；如果没有超过，则分析原因并继续提出新的创新点；
-如果超过，则记录创新点、参数和新的指标 log。
+Use this skill to run a closed-loop improvement process for the Python experiment code in this
+repository. The loop is:
 
-## 当前项目背景
+1. analyze the current code;
+2. propose one focused innovation;
+3. modify the relevant `.py` files;
+4. execute the code;
+5. record every metric;
+6. compare the new result against the previous best method;
+7. if the result is not better, analyze why and start another iteration;
+8. if the result is better, record the innovation, parameters, and final log.
 
-本仓库是一个基于 SDXL prompt feature 的情绪控制生成项目，核心文件如下：
+## Repository Context
 
-- `preprocess.py`：从 neutral/emotional prompt 和 valence/arousal 标签构建
-  `data/data-cache.pt`。
-- `model.py`：定义 `EmotionInjectionTransformer`，包含 arousal、valence 条件注入结构。
-- `train.py`：训练模型并打印 `train_loss`、`val_loss`，可选打印 `val_loss_weight`。
-- `inference.py`：使用指定 prompt、arousal、valence 和 checkpoint 生成单张图片。
-- `inference5x5.py`：对验证 prompt 生成 5x5 valence/arousal 网格图片。
-- `metrics/va_evaluate.py`：评估生成图片的 VA 控制效果，输出
-  `valence_abs_error` 和 `arousal_abs_error`。
-- `metrics/clip_score.py`：评估图片与文本 prompt 的一致性，输出 `CLIPScore`。
-- `metrics/clip_iqa.py`：评估无参考图片质量，输出 `CLIP-IQA`。
+This repository implements emotion-conditioned SDXL prompt feature generation.
 
-## 指标方向
+- `preprocess.py`: builds `data/data-cache.pt` from neutral/emotional prompts and
+  valence/arousal labels.
+- `model.py`: defines `EmotionInjectionTransformer` and the arousal/valence conditioning path.
+- `train.py`: trains the model and prints `train_loss`, `val_loss`, and optional
+  `val_loss_weight`.
+- `inference.py`: generates one image from a prompt, arousal value, valence value, and
+  checkpoint.
+- `inference5x5.py`: generates a 5x5 valence/arousal grid for validation prompts.
+- `metrics/va_evaluate.py`: evaluates generated images with VA predictors and logs
+  `valence_abs_error` and `arousal_abs_error`.
+- `metrics/clip_score.py`: evaluates image-text alignment with `CLIPScore`.
+- `metrics/clip_iqa.py`: evaluates no-reference image quality with `CLIP-IQA`.
 
-修改代码之前，必须先确定主指标和优化方向：
+## Metric Direction
 
-- 训练类指标：越低越好，例如 `val_loss`、`val_loss_weight`。
-- VA 控制指标：越低越好，例如 `VA valence_abs_error`、`VA arousal_abs_error`。
-- 图文一致性和图片质量指标：越高越好，例如 `CLIPScore`、`CLIP-IQA`。
+Before changing code, define the primary metric and its direction.
 
-如果任务没有额外指定，默认优先级如下：
+- Training metrics are better when lower: `val_loss`, `val_loss_weight`.
+- VA control metrics are better when lower: `VA valence_abs_error`,
+  `VA arousal_abs_error`.
+- Image-text and quality metrics are better when higher: `CLIPScore`, `CLIP-IQA`.
 
-1. VA 控制误差，因为项目核心目标是控制 valence/arousal。
-2. CLIPScore，避免生成图片偏离原 prompt。
-3. CLIP-IQA，避免图片质量下降。
-4. 训练验证损失，作为生成评估成本较高时的早期代理指标。
+Unless the task specifies another priority, use this metric priority:
 
-## 必须遵守的迭代流程
+1. VA control error, because the core task is controllable valence/arousal generation.
+2. CLIPScore, to avoid reducing prompt-image alignment.
+3. CLIP-IQA, to avoid reducing image quality.
+4. Validation loss, as an early proxy when image generation is expensive.
 
-每一轮实验都按以下顺序执行。
+## Required Iteration Loop
 
-### 1. 分析代码和基线
+Follow this sequence for every experiment.
 
-1. 先阅读相关 Python 文件，再提出修改方案。
-2. 明确当前基线方法：
-   - `model.py` 中的模型结构和情绪条件注入路径；
-   - `train.py` 中的 loss、权重、优化器和超参数；
-   - `inference.py` 或 `inference5x5.py` 中的推理参数；
-   - `metrics/` 下的指标脚本和 log 路径。
-3. 如果没有现成基线指标，先运行基线实验或收集已有 log。
-4. 按本文档的实验记录模板写入基线结果。
+### 1. Analyze the Code and Baseline
 
-### 2. 提出一个创新点
+1. Read the relevant Python files before proposing a change.
+2. Identify the current baseline method:
+   - model architecture and conditioning path in `model.py`;
+   - loss, weighting, optimizer, and hyperparameters in `train.py`;
+   - inference parameters in `inference.py` or `inference5x5.py`;
+   - metric scripts and log paths under `metrics/`.
+3. If no baseline metric is available, run the baseline experiment or collect the existing log.
+4. Record the baseline with the experiment template below.
 
-每一轮只提出一个主要创新点，且创新点必须能在 Python 中独立实现和独立评估。
+### 2. Propose One Innovation
 
-适合本项目的创新点示例：
+Propose exactly one main innovation per iteration. The innovation must be specific enough to
+implement in Python and evaluate independently.
 
-- 调整 arousal、valence token 融合到 `EmotionInjectionTransformer` 的方式；
-- 为情绪特征注入增加 residual gate；
-- 将 loss 目标从直接预测 emotional prompt feature 改为预测 residual delta；
-- 增加 density-aware 或 VA-magnitude-aware 的 loss weighting；
-- 调整 `scale_factor`、learning rate、batch size、weight decay 或 scheduler；
-- 调整推理参数，例如 `guidance_scale`、`num_inference_steps`、seed 策略；
-- 改进日志，让每次运行同时保存参数、checkpoint 路径和指标。
+Innovation examples for this repository:
 
-不要在同一轮混合多个无关想法。若指标提升，必须能清楚判断是哪一个创新点有效。
+- change how arousal/valence tokens are fused into `EmotionInjectionTransformer`;
+- add a residual gate for emotion feature injection;
+- change the loss target from direct emotional prompt feature prediction to residual delta
+  prediction;
+- add density-aware or VA-magnitude-aware loss weighting;
+- tune `scale_factor`, learning rate, batch size, weight decay, or scheduler behavior;
+- tune inference parameters such as `guidance_scale`, `num_inference_steps`, or seed policy;
+- improve logging so each run stores parameters, checkpoint path, output path, and metrics
+  together.
 
-### 3. 修改 Python 文件
+Do not mix unrelated ideas in one iteration. If the metric improves, the winning idea must be
+easy to identify.
 
-1. 只修改该创新点必需的 `.py` 文件。
-2. 改动保持小而可回滚。
-3. 对可调参数增加命令行参数，不要把实验值硬编码进代码。
-4. 程序运行时必须打印本次实际使用的关键参数。
-5. 除非创新点需要改变默认方法，否则保留原有默认值。
+### 3. Modify Python Files
 
-### 4. 执行代码
+1. Edit only the `.py` files required by the innovation.
+2. Keep the change small and reversible.
+3. Add command-line arguments for tunable parameters instead of hard-coding experiment values.
+4. Print the effective parameters at runtime.
+5. Preserve existing defaults unless the innovation intentionally changes the default method.
 
-先用最小但可信的评估运行实验，结果有希望后再扩大规模。
+### 4. Execute the Code
 
-训练示例：
+Run the smallest reliable evaluation first. Scale up only if the result is promising.
+
+Training command template:
 
 ```bash
 python train.py \
@@ -92,7 +106,7 @@ python train.py \
   --scale_factor 1.0
 ```
 
-生成 5x5 验证图片示例：
+5x5 validation generation command template:
 
 ```bash
 python inference5x5.py \
@@ -104,7 +118,7 @@ python inference5x5.py \
   --overwrite
 ```
 
-VA 指标评估示例：
+VA evaluation command template:
 
 ```bash
 python metrics/va_evaluate.py \
@@ -113,7 +127,7 @@ python metrics/va_evaluate.py \
   --batch_size 16
 ```
 
-CLIPScore 指标评估示例：
+CLIPScore evaluation command template:
 
 ```bash
 python metrics/clip_score.py \
@@ -122,7 +136,7 @@ python metrics/clip_score.py \
   --batch_size 16
 ```
 
-CLIP-IQA 指标评估示例：
+CLIP-IQA evaluation command template:
 
 ```bash
 python metrics/clip_iqa.py \
@@ -131,12 +145,12 @@ python metrics/clip_iqa.py \
   --batch_size 16
 ```
 
-### 5. 记录每一次指标
+### 5. Record Every Metric
 
-每次运行结束后都追加记录，不要跳过失败或变差的实验。
+Append a log entry after every run. Do not skip failed runs or worse runs.
 
 ```markdown
-## Experiment <编号>: <短名称>
+## Experiment <number>: <short_name>
 
 - Date:
 - Git commit:
@@ -167,73 +181,73 @@ python metrics/clip_iqa.py \
 - Notes:
 ```
 
-### 6. 判断是否超过前面方法
+### 6. Compare Against the Previous Best Method
 
-使用预先确定的主指标和前一个最好方法比较。
+Use the preselected primary metric for the decision.
 
-- 若指标越低越好：`new_metric < best_metric` 才算提升。
-- 若指标越高越好：`new_metric > best_metric` 才算提升。
-- 若指标包含均值和标准差，先比较均值，同时记录标准差。
-- 如果主指标提升但副指标下降，必须记录 trade-off，不能只报好结果。
+- If lower is better, the new method improves only when `new_metric < best_metric`.
+- If higher is better, the new method improves only when `new_metric > best_metric`.
+- If the metric includes mean and standard deviation, compare the mean first and record both.
+- If the primary metric improves but secondary metrics regress, record the trade-off explicitly.
 
-### 7. 如果没有超过
+### 7. If the New Method Does Not Improve
 
-当新指标没有超过 previous best 时：
+When the new metric does not beat the previous best:
 
-1. 将本轮实验标记为 rejected。
-2. 基于代码和 log 分析可能原因，例如：
-   - 优化不稳定；
-   - 过拟合或欠拟合；
-   - 情绪条件信号太弱或太强；
-   - loss weighting 与目标指标不一致；
-   - 训练参数和推理参数不匹配；
-   - prompt 或图片数量过少导致指标噪声较大。
-3. 根据失败原因提出下一轮新的创新点。
-4. 再次修改相关 `.py` 文件，只实现新想法。
-5. 继续运行并记录下一轮实验。
+1. Mark the experiment as `rejected`.
+2. Analyze likely causes using the code and logs, such as:
+   - optimization instability;
+   - overfitting or underfitting;
+   - emotion conditioning signal is too weak or too strong;
+   - loss weighting does not match the target metric;
+   - training parameters and inference parameters are mismatched;
+   - too few prompts or images created noisy metrics.
+3. Propose the next innovation based on the failure analysis.
+4. Modify only the `.py` files needed for the new idea.
+5. Run the next experiment and record the metrics again.
 
-### 8. 如果超过了
+### 8. If the New Method Improves
 
-当新指标超过 previous best 时：
+When the new metric beats the previous best:
 
-1. 将本轮实验标记为 accepted。
-2. 记录精确创新点和全部关键参数。
-3. 打印清晰 log，包含新指标和 previous best。
-4. 保存或标明 winning checkpoint 与输出图片目录。
-5. 保留成功的 Python 改动，并说明为什么该改动可能带来提升。
+1. Mark the experiment as `accepted`.
+2. Record the exact innovation and all key parameters.
+3. Print a clear log that includes the new metric and the previous best.
+4. Save or identify the winning checkpoint and output image directory.
+5. Keep the successful Python changes and explain why the change likely improved the metric.
 
-成功时使用如下 log 格式：
+Use this success log format:
 
 ```text
 [NEW BEST]
-innovation: <创新点简述>
-parameters: <key=value 参数列表>
-primary_metric: <指标名>
-previous_best: <旧值>
-new_metric: <新值>
-delta: <提升幅度>
-checkpoint: <checkpoint 路径>
-outputs: <输出目录>
-log: <log 路径>
+innovation: <short description>
+parameters: <key=value list>
+primary_metric: <metric name>
+previous_best: <old value>
+new_metric: <new value>
+delta: <improvement amount>
+checkpoint: <checkpoint path>
+outputs: <output directory>
+log: <log path>
 ```
 
-## 决策规则
+## Decision Rules
 
-- 每轮只改变一个主要想法。
-- 优先依赖可量化指标，而不是只看主观图片效果。
-- 所有日志都要保留，包括失败实验。
-- 只有主指标超过 previous best，才能宣布成功。
-- 如果指标波动明显，接受新方法前要换 seed 重跑验证。
-- 如果代码运行失败，先记录错误，再做最小修复，并用同一创新点重跑。
+- Change only one main idea per iteration.
+- Prefer measurable metrics over subjective visual-only judgments.
+- Keep all logs, including failed experiments.
+- Do not declare success unless the selected primary metric beats the previous best.
+- If metrics are noisy, rerun the same configuration with another seed before accepting it.
+- If the code fails, log the error, make the smallest necessary fix, and rerun the same idea.
 
-## 最终总结
+## Final Report Template
 
-循环结束后，总结以下内容：
+At the end of the loop, summarize:
 
-1. baseline 指标；
-2. 每一个尝试过的创新点；
-3. accepted 和 rejected 的实验；
-4. 最优参数；
-5. 最终指标 log；
-6. 修改过的 Python 文件；
-7. 剩余风险和下一步可尝试方向。
+1. baseline metric;
+2. every attempted innovation;
+3. accepted and rejected experiments;
+4. best parameters;
+5. final metric log;
+6. modified Python files;
+7. remaining risks and next ideas.
