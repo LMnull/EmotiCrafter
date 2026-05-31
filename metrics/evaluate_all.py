@@ -1,5 +1,7 @@
 import argparse
+import inspect
 import json
+import sys
 from datetime import datetime, timezone
 from time import perf_counter
 from pathlib import Path
@@ -9,6 +11,9 @@ import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 METRICS_DIR = Path(__file__).resolve().parent
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "results" / "val_prompt_5x5"
 DEFAULT_LOG_PATH = PROJECT_ROOT / "log.txt"
@@ -122,9 +127,17 @@ def parse_args():
 
 def main():
     args = parse_args()
-    from clip_iqa import evaluate_directory as evaluate_clip_iqa_directory
-    from clip_score import evaluate_directory as evaluate_clip_score_directory
-    from va_evaluate import evaluate_directory as evaluate_va_directory
+    from metrics.clip_iqa import evaluate_directory as evaluate_clip_iqa_directory
+    from metrics.clip_score import evaluate_directory as evaluate_clip_score_directory
+    from metrics.va_evaluate import evaluate_directory as evaluate_va_directory
+
+    clip_iqa_params = inspect.signature(evaluate_clip_iqa_directory).parameters
+    required_clip_iqa_params = {"positive_prompt", "negative_prompt", "logit_scale", "backend"}
+    if not required_clip_iqa_params.issubset(clip_iqa_params):
+        raise RuntimeError(
+            "Loaded metrics.clip_iqa.evaluate_directory does not support the official CLIP-IQA "
+            "arguments. Please update metrics/clip_iqa.py together with metrics/evaluate_all.py."
+        )
 
     used_device = resolve_device(args.device)
     started_at = datetime.now(timezone.utc).astimezone()
