@@ -26,7 +26,7 @@ DEFAULT_VALENCE_CKPT = METRICS_DIR / "valence1_CLIP_lr=0.0001_loss=MSELoss_sc=te
 
 def format_mean_std(values: Sequence[float]) -> str:
     values = np.asarray(values, dtype=np.float64)
-    return f"{values.mean():.4f} ± {values.std(ddof=0):.4f}"
+    return f"{values.mean():.3f} ± {values.std(ddof=0):.3f}"
 
 
 def summarize_va(results: Dict[str, np.ndarray]) -> Dict[str, str]:
