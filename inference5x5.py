@@ -35,8 +35,11 @@ def load_prompts(prompt_json):
 
 
 def normalize_state_dict(state_dict):
-    if isinstance(state_dict, dict) and "state_dict" in state_dict:
-        state_dict = state_dict["state_dict"]
+    if isinstance(state_dict, dict):
+        for key in ("state_dict", "model_state_dict", "model"):
+            if key in state_dict and isinstance(state_dict[key], dict):
+                state_dict = state_dict[key]
+                break
     if not isinstance(state_dict, dict):
         raise TypeError("Checkpoint must be a state_dict or contain a 'state_dict' entry.")
     if any(key.startswith("module.") for key in state_dict):
@@ -68,7 +71,7 @@ def load_eit(ckpt_path, device, use_data_parallel=False):
         eit = torch.nn.DataParallel(eit)
     ckpt = torch.load(ckpt_path, map_location=device)
     target = eit.module if isinstance(eit, torch.nn.DataParallel) else eit
-    target.load_state_dict(normalize_state_dict(ckpt))
+    target.load_state_dict(normalize_state_dict(ckpt), strict=True)
     eit.eval()
     return eit.to(device)
 
