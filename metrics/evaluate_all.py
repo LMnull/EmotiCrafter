@@ -20,7 +20,7 @@ METRICS_DIR = Path(__file__).resolve().parent
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "results" / "val_prompt_5x5"
 DEFAULT_LOG_PATH = PROJECT_ROOT / "log.txt"
 DEFAULT_VA_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-base-patch32")
-DEFAULT_CLIP_SCORE_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-base-patch32")
+DEFAULT_CLIP_SCORE_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-large-patch14")
 DEFAULT_CLIP_IQA_MODEL_PATH = Path("/root/shared-nvme/model/RN50.pt")
 DEFAULT_AROUSAL_CKPT = METRICS_DIR / "arousal1_CLIP_lr=0.001_loss=MSELoss_sc=test_cuda-1.pth"
 DEFAULT_VALENCE_CKPT = METRICS_DIR / "valence1_CLIP_lr=0.0001_loss=MSELoss_sc=test_cuda.pth"
@@ -370,8 +370,8 @@ def parse_args():
     parser.add_argument("--arousal_ckpt", type=Path, default=DEFAULT_AROUSAL_CKPT)
     parser.add_argument("--valence_ckpt", type=Path, default=DEFAULT_VALENCE_CKPT)
     parser.add_argument("--clip_score_model_path", type=Path, default=DEFAULT_CLIP_SCORE_MODEL_PATH)
-    parser.add_argument("--clip_score_text_prefix", type=str, default="A photo depicts ")
-    parser.add_argument("--clip_score_weight", type=float, default=2.5)
+    parser.add_argument("--clip_score_text_prefix", type=str, default="")
+    parser.add_argument("--clip_score_weight", type=float, default=100.0)
     parser.add_argument("--clip_score_output_scale", type=float, default=1.0)
     parser.add_argument("--clip_iqa_model_path", type=Path, default=DEFAULT_CLIP_IQA_MODEL_PATH)
     parser.add_argument("--clip_iqa_positive_prompt", type=str, default="Good photo.")

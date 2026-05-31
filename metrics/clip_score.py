@@ -11,7 +11,7 @@ from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "results" / "val_prompt_5x5"
-DEFAULT_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-base-patch32")
+DEFAULT_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-large-patch14")
 DEFAULT_LOG_PATH = PROJECT_ROOT / "log.txt"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 PROMPT_NAME_RE = re.compile(r"^(?P<prompt>.+)_v-?\d+(?:\.\d+)?_a-?\d+(?:\.\d+)?$")
@@ -23,17 +23,14 @@ class CLIPScore:
 
     The per-sample score follows:
         score_weight * max(0, cos(text_feature, image_feature))
-
-    The paper configuration uses CLIP ViT-B/32, text prefix
-    "A photo depicts ", and score_weight=2.5.
     """
 
     def __init__(
         self,
         model_path: Union[str, Path] = DEFAULT_MODEL_PATH,
         device: Optional[str] = None,
-        text_prefix: str = "A photo depicts ",
-        score_weight: float = 2.5,
+        text_prefix: str = "",
+        score_weight: float = 100.0,
         output_scale: float = 1.0,
     ):
         if device is None:
@@ -171,8 +168,8 @@ def evaluate_directory(
     device: Optional[str],
     batch_size: int,
     limit: Optional[int] = None,
-    text_prefix: str = "A photo depicts ",
-    score_weight: float = 2.5,
+    text_prefix: str = "",
+    score_weight: float = 100.0,
     output_scale: float = 1.0,
 ):
     if batch_size < 1:
@@ -240,8 +237,8 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--text_prefix", type=str, default="A photo depicts ")
-    parser.add_argument("--score_weight", type=float, default=2.5)
+    parser.add_argument("--text_prefix", type=str, default="")
+    parser.add_argument("--score_weight", type=float, default=100.0)
     parser.add_argument("--output_scale", type=float, default=1.0)
     parser.add_argument("--overwrite_log", action="store_true")
     return parser.parse_args()
