@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "results" / "val_prompt_5x5"
-DEFAULT_CLIP_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-large-patch14")
+DEFAULT_CLIP_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-base-patch32")
 DEFAULT_CLIP_IQA_MODEL_PATH = Path("/root/shared-nvme/model/RN50.pt")
 DEFAULT_LOG_PATH = PROJECT_ROOT / "diagnostics_log.txt"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
