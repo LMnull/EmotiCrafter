@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from typing import List, Optional, Sequence, Union
+from typing import List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -13,42 +13,81 @@ DEFAULT_IMAGE_DIR = PROJECT_ROOT / "results" / "val_prompt_5x5"
 DEFAULT_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-large-patch14")
 DEFAULT_LOG_PATH = PROJECT_ROOT / "log.txt"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+CLIPIQA_BACKENDS = Literal["auto", "transformers", "openai_clip"]
 
 
 class CLIPIQA:
     """
-    CLIP-IQA style no-reference image quality score.
+    CLIP-IQA no-reference image quality score.
 
-    Scores are in the same 0-1 range as the original implementation in this repo.
+    This follows the official CLIP-IQA fixed-prompt formulation:
+    compute similarities to a positive/negative prompt pair and return the
+    softmax probability of the positive prompt.
     """
 
     def __init__(
         self,
         model_path: Union[str, Path] = DEFAULT_MODEL_PATH,
         device: Optional[str] = None,
+        prompt_pair: Tuple[str, str] = ("Good photo.", "Bad photo."),
+        logit_scale: Literal["learned", "100"] = "learned",
+        backend: CLIPIQA_BACKENDS = "auto",
     ):
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
 
+        if len(prompt_pair) != 2:
+            raise ValueError("prompt_pair must contain exactly two prompts: positive and negative.")
+        self.model_path = Path(model_path)
+        self.prompt_pair = prompt_pair
+        self.logit_scale = logit_scale
+        self.backend = self.resolve_backend(backend, self.model_path)
+
+        if self.backend == "openai_clip":
+            self.init_openai_clip(self.model_path)
+        elif self.backend == "transformers":
+            self.init_transformers_clip(self.model_path)
+        else:
+            raise ValueError(f"Unsupported CLIP-IQA backend: {self.backend}")
+
+        self.anchor_features = self.encode_text_prompts(self.prompt_pair)
+
+    @staticmethod
+    def resolve_backend(backend: CLIPIQA_BACKENDS, model_path: Path) -> str:
+        if backend != "auto":
+            return backend
+        return "openai_clip" if model_path.is_file() and model_path.suffix == ".pt" else "transformers"
+
+    def init_transformers_clip(self, model_path: Path):
         from transformers import CLIPModel, CLIPProcessor
 
         self.model = CLIPModel.from_pretrained(str(model_path)).to(self.device)
         self.processor = CLIPProcessor.from_pretrained(str(model_path))
         self.model.eval()
 
-        self.quality_levels = [
-            "excellent quality",
-            "good quality",
-            "fair quality",
-            "poor quality",
-            "bad quality",
-        ]
-        self.quality_scores = torch.tensor([100, 75, 50, 25, 0], dtype=torch.float32, device=self.device)
-        self.anchor_features = self.encode_text_prompts(self.quality_levels)
+    def init_openai_clip(self, model_path: Path):
+        try:
+            import clip
+        except ImportError as exc:
+            raise ImportError(
+                "OpenAI CLIP is required for RN50.pt CLIP-IQA. Install it with:\n"
+                "pip install git+https://github.com/openai/CLIP.git"
+            ) from exc
+
+        self.clip = clip
+        self.model, self.preprocess = clip.load(str(model_path), device=self.device)
+        self.model.eval()
+        self.tokenized_prompts = clip.tokenize(list(self.prompt_pair)).to(self.device)
 
     def encode_text_prompts(self, prompts: Sequence[str]) -> torch.Tensor:
+        if self.backend == "openai_clip":
+            with torch.no_grad():
+                text_features = self.model.encode_text(self.tokenized_prompts)
+                text_features = F.normalize(text_features.float(), dim=-1)
+            return text_features
+
         inputs = self.processor(
             text=list(prompts),
             return_tensors="pt",
@@ -71,6 +110,13 @@ class CLIPIQA:
                 with Image.open(image) as opened_image:
                     pil_images.append(opened_image.convert("RGB"))
 
+        if self.backend == "openai_clip":
+            image_tensor = torch.stack([self.preprocess(image) for image in pil_images]).to(self.device)
+            with torch.no_grad():
+                image_features = self.model.encode_image(image_tensor)
+                image_features = F.normalize(image_features.float(), dim=-1)
+            return image_features
+
         inputs = self.processor(images=pil_images, return_tensors="pt")
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
@@ -82,8 +128,13 @@ class CLIPIQA:
     def compute_quality_scores(self, images: Sequence[Union[str, Path, Image.Image]]) -> np.ndarray:
         image_features = self.encode_images(images)
         similarities = image_features @ self.anchor_features.T
-        weights = F.softmax(similarities * 10, dim=-1)
-        scores = (weights * self.quality_scores).sum(dim=-1) / 100
+        if self.logit_scale == "learned":
+            scale = self.model.logit_scale.exp().to(similarities.device)
+        elif self.logit_scale == "100":
+            scale = 100.0
+        else:
+            raise ValueError("logit_scale must be either 'learned' or '100'")
+        scores = F.softmax(similarities * scale, dim=-1)[:, 0]
         return scores.detach().cpu().numpy()
 
     def compute_quality_score(self, image: Union[str, Path, Image.Image]) -> float:
@@ -115,6 +166,10 @@ def evaluate_directory(
     device: Optional[str],
     batch_size: int,
     limit: Optional[int] = None,
+    positive_prompt: str = "Good photo.",
+    negative_prompt: str = "Bad photo.",
+    logit_scale: Literal["learned", "100"] = "learned",
+    backend: CLIPIQA_BACKENDS = "auto",
 ) -> np.ndarray:
     if batch_size < 1:
         raise ValueError("batch_size must be greater than 0")
@@ -125,7 +180,13 @@ def evaluate_directory(
     if not image_paths:
         raise ValueError(f"No valid images found in {image_dir}")
 
-    metric = CLIPIQA(model_path=model_path, device=device)
+    metric = CLIPIQA(
+        model_path=model_path,
+        device=device,
+        prompt_pair=(positive_prompt, negative_prompt),
+        logit_scale=logit_scale,
+        backend=backend,
+    )
     all_scores: List[float] = []
 
     for batch_index, batch in enumerate(chunked(image_paths, batch_size), start=1):
@@ -165,6 +226,10 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--positive_prompt", type=str, default="Good photo.")
+    parser.add_argument("--negative_prompt", type=str, default="Bad photo.")
+    parser.add_argument("--logit_scale", choices=["learned", "100"], default="learned")
+    parser.add_argument("--backend", choices=["auto", "transformers", "openai_clip"], default="auto")
     parser.add_argument("--overwrite_log", action="store_true")
     return parser.parse_args()
 
@@ -177,6 +242,10 @@ if __name__ == "__main__":
         device=args.device,
         batch_size=args.batch_size,
         limit=args.limit,
+        positive_prompt=args.positive_prompt,
+        negative_prompt=args.negative_prompt,
+        logit_scale=args.logit_scale,
+        backend=args.backend,
     )
     used_device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     write_log(

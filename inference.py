@@ -3,6 +3,30 @@ from model import  EmotionInjectionTransformer
 from diffusers import StableDiffusionXLPipeline
 import torch
 import argparse
+
+
+def normalize_state_dict(state_dict):
+    if isinstance(state_dict, dict):
+        for key in ("state_dict", "model_state_dict", "model"):
+            if key in state_dict and isinstance(state_dict[key], dict):
+                state_dict = state_dict[key]
+                break
+    if not isinstance(state_dict, dict):
+        raise TypeError("Checkpoint must be a state_dict or contain a state_dict-like entry.")
+    if any(key.startswith("module.") for key in state_dict):
+        return {key.removeprefix("module."): value for key, value in state_dict.items()}
+    return state_dict
+
+
+def load_eit(ckpt_path, device):
+    config = GPT2Config.from_pretrained('./config')
+    eit = EmotionInjectionTransformer(config, final_out_type="Linear+LN").to(device)
+    ckpt = torch.load(ckpt_path, map_location=device)
+    eit.load_state_dict(normalize_state_dict(ckpt), strict=True)
+    eit.eval()
+    return eit.to(device)
+
+
 def emoticrafter(pipe,eit, prompt,a = 0, v = 0, device = "cuda", seed = 42 ):
     (   prompt_embeds_ori, 
         negative_prompt_embeds,
@@ -51,13 +75,7 @@ if __name__ == "__main__":
     ckpt_path = args.ckpt_path 
     sdxl_path = args.sdxl_path
 
-    config = GPT2Config.from_pretrained('./config')
-    eit = EmotionInjectionTransformer(config,final_out_type="Linear+LN").to(device)
-    eit = torch.nn.DataParallel(eit)
-    ckpt = torch.load(ckpt_path)
-    eit.load_state_dict(ckpt)
-    eit.eval()
-    eit.to(device)
+    eit = load_eit(ckpt_path, device)
     
     pipe = StableDiffusionXLPipeline.from_pretrained(sdxl_path, torch_dtype=torch.float16, 
                                                     use_safetensors=True, variant="fp16")

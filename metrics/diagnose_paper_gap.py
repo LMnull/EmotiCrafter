@@ -6,18 +6,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import torch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from metrics.clip_score import CLIPScore  # noqa: E402
-
 
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "results" / "val_prompt_5x5"
 DEFAULT_CLIP_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-large-patch14")
+DEFAULT_CLIP_IQA_MODEL_PATH = Path("/root/shared-nvme/model/RN50.pt")
 DEFAULT_LOG_PATH = PROJECT_ROOT / "diagnostics_log.txt"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 IMAGE_NAME_RE = re.compile(
@@ -32,7 +30,7 @@ class ImageRecord:
     valence: float
     arousal: float
     clip_score: Optional[float] = None
-    pyiqa_score: Optional[float] = None
+    clip_iqa_score: Optional[float] = None
 
 
 def parse_image_record(image_path: Path) -> ImageRecord:
@@ -93,6 +91,8 @@ def compute_clip_scores(
     device: Optional[str],
     batch_size: int,
 ):
+    from metrics.clip_score import CLIPScore
+
     metric = CLIPScore(model_path=model_path, device=device)
     for batch_index, batch in enumerate(chunked(records, batch_size), start=1):
         image_paths = [record.path for record in batch]
@@ -104,63 +104,34 @@ def compute_clip_scores(
         print(f"CLIPScore batch {batch_index}: processed {done}/{len(records)}", flush=True)
 
 
-def try_import_pyiqa():
-    try:
-        import pyiqa
-
-        return pyiqa, None
-    except ImportError as error:
-        return None, error
-
-
-def image_to_tensor(image_path: Path, device: str) -> torch.Tensor:
-    from PIL import Image
-
-    image = Image.open(image_path).convert("RGB")
-    array = np.asarray(image, dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
-    return tensor.to(device)
-
-
-def scalar_from_metric_output(output) -> float:
-    if isinstance(output, torch.Tensor):
-        return float(output.detach().cpu().flatten().mean().item())
-    return float(np.asarray(output, dtype=np.float32).mean())
-
-
-def compute_pyiqa_scores(
+def compute_clip_iqa_scores(
     records: Sequence[ImageRecord],
-    metric_name: str,
+    model_path: Path,
     device: str,
-    input_mode: str,
-    strict: bool,
+    batch_size: int,
+    positive_prompt: str,
+    negative_prompt: str,
+    logit_scale: str,
+    backend: str,
 ):
-    pyiqa, import_error = try_import_pyiqa()
-    if pyiqa is None:
-        message = (
-            "Official CLIP-IQA skipped: pyiqa is not installed in this environment. "
-            "Install pyiqa or run this script in the paper's evaluation environment."
-        )
-        if strict:
-            raise RuntimeError(message) from import_error
-        print(message, flush=True)
-        return message
+    import torch
+    from metrics.clip_iqa import CLIPIQA
 
-    metric = pyiqa.create_metric(metric_name, device=device)
+    metric = CLIPIQA(
+        model_path=model_path,
+        device=device,
+        prompt_pair=(positive_prompt, negative_prompt),
+        logit_scale=logit_scale,
+        backend=backend,
+    )
     with torch.no_grad():
-        for index, record in enumerate(records, start=1):
-            if input_mode == "path":
-                output = metric(str(record.path))
-            elif input_mode == "tensor":
-                output = metric(image_to_tensor(record.path, device))
-            else:
-                raise ValueError("input_mode must be 'path' or 'tensor'")
-
-            record.pyiqa_score = scalar_from_metric_output(output)
-            if index % 100 == 0 or index == len(records):
-                print(f"{metric_name} batch: processed {index}/{len(records)}", flush=True)
-
-    return None
+        for batch_index, batch in enumerate(chunked(records, batch_size), start=1):
+            image_paths = [record.path for record in batch]
+            scores = metric.compute_quality_scores(image_paths)
+            for record, score in zip(batch, scores):
+                record.clip_iqa_score = float(score)
+            done = min(batch_index * batch_size, len(records))
+            print(f"CLIP-IQA batch {batch_index}: processed {done}/{len(records)}", flush=True)
 
 
 def collect_scores(records: Sequence[ImageRecord], score_name: str) -> List[float]:
@@ -222,15 +193,23 @@ def build_report(
     records: Sequence[ImageRecord],
     image_dir: Path,
     clip_model_path: Path,
+    clip_iqa_model_path: Path,
+    clip_iqa_backend: str,
+    clip_iqa_positive_prompt: str,
+    clip_iqa_negative_prompt: str,
+    clip_iqa_logit_scale: str,
     device: str,
-    pyiqa_metric: str,
-    pyiqa_skip_reason: Optional[str],
 ) -> str:
     lines = [
         "EmotiCrafter paper-gap diagnostics",
         f"num_images: {len(records)}",
         f"input_dir: {image_dir}",
         f"clip_model_path: {clip_model_path}",
+        f"clip_iqa_model_path: {clip_iqa_model_path}",
+        f"clip_iqa_backend: {clip_iqa_backend}",
+        f"clip_iqa_positive_prompt: {clip_iqa_positive_prompt}",
+        f"clip_iqa_negative_prompt: {clip_iqa_negative_prompt}",
+        f"clip_iqa_logit_scale: {clip_iqa_logit_scale}",
         f"device: {device}",
         "",
     ]
@@ -239,10 +218,8 @@ def build_report(
         add_group_summary(lines, records, "clip_score", "CLIPScore")
         lines.append("")
 
-    if collect_scores(records, "pyiqa_score"):
-        add_group_summary(lines, records, "pyiqa_score", f"Official CLIP-IQA ({pyiqa_metric})")
-    elif pyiqa_skip_reason:
-        lines.append(pyiqa_skip_reason)
+    if collect_scores(records, "clip_iqa_score"):
+        add_group_summary(lines, records, "clip_iqa_score", "Official CLIP-IQA")
 
     return "\n".join(lines) + "\n"
 
@@ -262,10 +239,12 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--skip_clipscore", action="store_true")
-    parser.add_argument("--skip_pyiqa", action="store_true")
-    parser.add_argument("--pyiqa_metric", type=str, default="clipiqa")
-    parser.add_argument("--pyiqa_input", choices=["path", "tensor"], default="path")
-    parser.add_argument("--strict_pyiqa", action="store_true")
+    parser.add_argument("--skip_clip_iqa", "--skip_pyiqa", action="store_true", dest="skip_clip_iqa")
+    parser.add_argument("--clip_iqa_model_path", type=Path, default=DEFAULT_CLIP_IQA_MODEL_PATH)
+    parser.add_argument("--clip_iqa_backend", choices=["auto", "transformers", "openai_clip"], default="auto")
+    parser.add_argument("--clip_iqa_positive_prompt", type=str, default="Good photo.")
+    parser.add_argument("--clip_iqa_negative_prompt", type=str, default="Bad photo.")
+    parser.add_argument("--clip_iqa_logit_scale", choices=["learned", "100"], default="learned")
     return parser.parse_args()
 
 
@@ -274,7 +253,12 @@ def main():
     if args.batch_size < 1:
         raise ValueError("batch_size must be greater than 0")
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device:
+        device = args.device
+    else:
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     records = load_records(args.image_dir, limit=args.limit)
 
     if not args.skip_clipscore:
@@ -285,23 +269,28 @@ def main():
             batch_size=args.batch_size,
         )
 
-    pyiqa_skip_reason = None
-    if not args.skip_pyiqa:
-        pyiqa_skip_reason = compute_pyiqa_scores(
+    if not args.skip_clip_iqa:
+        compute_clip_iqa_scores(
             records=records,
-            metric_name=args.pyiqa_metric,
+            model_path=args.clip_iqa_model_path,
             device=device,
-            input_mode=args.pyiqa_input,
-            strict=args.strict_pyiqa,
+            batch_size=args.batch_size,
+            positive_prompt=args.clip_iqa_positive_prompt,
+            negative_prompt=args.clip_iqa_negative_prompt,
+            logit_scale=args.clip_iqa_logit_scale,
+            backend=args.clip_iqa_backend,
         )
 
     report = build_report(
         records=records,
         image_dir=args.image_dir,
         clip_model_path=args.clip_model_path,
+        clip_iqa_model_path=args.clip_iqa_model_path,
+        clip_iqa_backend=args.clip_iqa_backend,
+        clip_iqa_positive_prompt=args.clip_iqa_positive_prompt,
+        clip_iqa_negative_prompt=args.clip_iqa_negative_prompt,
+        clip_iqa_logit_scale=args.clip_iqa_logit_scale,
         device=device,
-        pyiqa_metric=args.pyiqa_metric,
-        pyiqa_skip_reason=pyiqa_skip_reason,
     )
     write_report(args.log_path, report)
 
