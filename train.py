@@ -37,21 +37,31 @@ class EmotionDataset(Dataset):
             'density': torch.as_tensor([item['density']], dtype=torch.float32),
         }
 
-def unwrap_model(model):
-    return model.module if isinstance(model, torch.nn.DataParallel) else model
-
 def normalize_state_dict(state_dict):
-    if isinstance(state_dict, dict) and "state_dict" in state_dict:
-        state_dict = state_dict["state_dict"]
+    if isinstance(state_dict, dict):
+        for key in ("state_dict", "model_state_dict", "model"):
+            if key in state_dict and isinstance(state_dict[key], dict):
+                state_dict = state_dict[key]
+                break
     if not isinstance(state_dict, dict):
         raise TypeError("Checkpoint must be a state_dict or contain a 'state_dict' entry.")
-    if any(key.startswith("module.") for key in state_dict):
+    return state_dict
+
+def adapt_state_dict_to_model(state_dict, model):
+    state_dict = normalize_state_dict(state_dict)
+    model_keys = model.state_dict().keys()
+    model_uses_module = any(key.startswith("module.") for key in model_keys)
+    checkpoint_uses_module = any(key.startswith("module.") for key in state_dict)
+
+    if model_uses_module and not checkpoint_uses_module:
+        return {f"module.{key}": value for key, value in state_dict.items()}
+    if checkpoint_uses_module and not model_uses_module:
         return {key.removeprefix("module."): value for key, value in state_dict.items()}
     return state_dict
 
 def load_model_state(model, ckpt_path, device):
     checkpoint = torch.load(ckpt_path, map_location=device)
-    unwrap_model(model).load_state_dict(normalize_state_dict(checkpoint))
+    model.load_state_dict(adapt_state_dict_to_model(checkpoint, model), strict=True)
 
 def validate_input_file(path, arg_name, expected_description):
     if os.path.isdir(path):
@@ -230,17 +240,17 @@ def main():
         if not os.path.exists(args.save_dir):
             os.makedirs(args.save_dir)
         if (epoch + 1) % 50 == 0:
-            torch.save(unwrap_model(model).state_dict(), os.path.join(args.save_dir, f'model_epoch_{epoch+1}.pth'))
+            torch.save(model.state_dict(), os.path.join(args.save_dir, f'model_epoch_{epoch+1}.pth'))
         
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(unwrap_model(model).state_dict(), best_model_path)
+            torch.save(model.state_dict(), best_model_path)
             print(f"New best model saved with validation loss: {best_val_loss:.4f}")
         if  args.enable_density:
             if val_loss_weight < best_val_loss_weight:
                 best_val_loss_weight = val_loss_weight
-                torch.save(unwrap_model(model).state_dict(), best_model_path_weight)
+                torch.save(model.state_dict(), best_model_path_weight)
                 print(f"New best model saved with weighted validation loss: {best_val_loss_weight:.4f}")
     if use_wandb:
         wandb.finish()
