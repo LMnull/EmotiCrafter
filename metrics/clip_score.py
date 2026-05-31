@@ -11,7 +11,7 @@ from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "results" / "val_prompt_5x5"
-DEFAULT_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-large-patch14")
+DEFAULT_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-base-patch32")
 DEFAULT_LOG_PATH = PROJECT_ROOT / "log.txt"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 PROMPT_NAME_RE = re.compile(r"^(?P<prompt>.+)_v-?\d+(?:\.\d+)?_a-?\d+(?:\.\d+)?$")

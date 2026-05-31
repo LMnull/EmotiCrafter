@@ -20,7 +20,7 @@ METRICS_DIR = Path(__file__).resolve().parent
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "results" / "val_prompt_5x5"
 DEFAULT_LOG_PATH = PROJECT_ROOT / "log.txt"
 DEFAULT_VA_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-base-patch32")
-DEFAULT_CLIP_SCORE_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-large-patch14")
+DEFAULT_CLIP_SCORE_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-base-patch32")
 DEFAULT_CLIP_IQA_MODEL_PATH = Path("/root/shared-nvme/model/RN50.pt")
 DEFAULT_AROUSAL_CKPT = METRICS_DIR / "arousal1_CLIP_lr=0.001_loss=MSELoss_sc=test_cuda-1.pth"
 DEFAULT_VALENCE_CKPT = METRICS_DIR / "valence1_CLIP_lr=0.0001_loss=MSELoss_sc=test_cuda.pth"
