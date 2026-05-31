@@ -370,7 +370,7 @@ def parse_args():
     parser.add_argument("--arousal_ckpt", type=Path, default=DEFAULT_AROUSAL_CKPT)
     parser.add_argument("--valence_ckpt", type=Path, default=DEFAULT_VALENCE_CKPT)
     parser.add_argument("--clip_score_model_path", type=Path, default=DEFAULT_CLIP_SCORE_MODEL_PATH)
-    parser.add_argument("--clip_score_text_prefix", type=str, default="")
+    parser.add_argument("--clip_score_text_prefix", type=str, default="A photo depicts ")
     parser.add_argument("--clip_score_weight", type=float, default=100.0)
     parser.add_argument("--clip_score_output_scale", type=float, default=1.0)
     parser.add_argument("--clip_iqa_model_path", type=Path, default=DEFAULT_CLIP_IQA_MODEL_PATH)

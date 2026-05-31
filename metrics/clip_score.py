@@ -29,7 +29,7 @@ class CLIPScore:
         self,
         model_path: Union[str, Path] = DEFAULT_MODEL_PATH,
         device: Optional[str] = None,
-        text_prefix: str = "",
+        text_prefix: str = "A photo depicts ",
         score_weight: float = 100.0,
         output_scale: float = 1.0,
     ):
@@ -168,7 +168,7 @@ def evaluate_directory(
     device: Optional[str],
     batch_size: int,
     limit: Optional[int] = None,
-    text_prefix: str = "",
+    text_prefix: str = "A photo depicts ",
     score_weight: float = 100.0,
     output_scale: float = 1.0,
 ):
@@ -237,7 +237,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--text_prefix", type=str, default="")
+    parser.add_argument("--text_prefix", type=str, default="A photo depicts ")
     parser.add_argument("--score_weight", type=float, default=100.0)
     parser.add_argument("--output_scale", type=float, default=1.0)
     parser.add_argument("--overwrite_log", action="store_true")
