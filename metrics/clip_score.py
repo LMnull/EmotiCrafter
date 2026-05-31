@@ -11,7 +11,7 @@ from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "results" / "val_prompt_5x5"
-DEFAULT_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-large-patch14")
+DEFAULT_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-base-patch32")
 DEFAULT_LOG_PATH = PROJECT_ROOT / "log.txt"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 PROMPT_NAME_RE = re.compile(r"^(?P<prompt>.+)_v-?\d+(?:\.\d+)?_a-?\d+(?:\.\d+)?$")
@@ -22,13 +22,19 @@ class CLIPScore:
     CLIPScore for image-text alignment.
 
     The per-sample score follows:
-        max(0, 100 * cos(text_feature, image_feature))
+        score_weight * max(0, cos(text_feature, image_feature))
+
+    The paper configuration uses CLIP ViT-B/32, text prefix
+    "A photo depicts ", and score_weight=2.5.
     """
 
     def __init__(
         self,
         model_path: Union[str, Path] = DEFAULT_MODEL_PATH,
         device: Optional[str] = None,
+        text_prefix: str = "A photo depicts ",
+        score_weight: float = 2.5,
+        output_scale: float = 1.0,
     ):
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -40,6 +46,9 @@ class CLIPScore:
         self.model = CLIPModel.from_pretrained(str(model_path)).to(self.device)
         self.processor = CLIPProcessor.from_pretrained(str(model_path))
         self.model.eval()
+        self.text_prefix = text_prefix
+        self.score_weight = score_weight
+        self.output_scale = output_scale
 
     def compute_image_features(
         self,
@@ -68,6 +77,7 @@ class CLIPScore:
     def compute_text_features(self, texts: Union[str, Sequence[str]]):
         if isinstance(texts, str):
             texts = [texts]
+        texts = [f"{self.text_prefix}{text}" if self.text_prefix else text for text in texts]
 
         inputs = self.processor(
             text=list(texts),
@@ -94,7 +104,7 @@ class CLIPScore:
         image_features = self.compute_image_features(images)
         text_features = self.compute_text_features(texts)
         similarities = (image_features * text_features).sum(dim=-1)
-        scores = torch.clamp(similarities * 100, min=0)
+        scores = torch.clamp(similarities, min=0) * self.score_weight * self.output_scale
         return scores.detach().cpu().numpy()
 
     def score(
@@ -114,7 +124,11 @@ class CLIPScore:
         else:
             image_features = self.compute_image_features(image_list)
             text_features = self.compute_text_features(text_list)
-            scores = torch.clamp(image_features @ text_features.T * 100, min=0).detach().cpu().numpy()
+            scores = (
+                torch.clamp(image_features @ text_features.T, min=0)
+                * self.score_weight
+                * self.output_scale
+            ).detach().cpu().numpy()
 
         if reduction == "mean":
             return float(np.mean(scores))
@@ -157,6 +171,9 @@ def evaluate_directory(
     device: Optional[str],
     batch_size: int,
     limit: Optional[int] = None,
+    text_prefix: str = "A photo depicts ",
+    score_weight: float = 2.5,
+    output_scale: float = 1.0,
 ):
     if batch_size < 1:
         raise ValueError("batch_size must be greater than 0")
@@ -167,7 +184,13 @@ def evaluate_directory(
     if not pairs:
         raise ValueError(f"No valid images found in {image_dir}")
 
-    metric = CLIPScore(model_path=model_path, device=device)
+    metric = CLIPScore(
+        model_path=model_path,
+        device=device,
+        text_prefix=text_prefix,
+        score_weight=score_weight,
+        output_scale=output_scale,
+    )
     all_scores: List[float] = []
 
     for batch_index, batch in enumerate(chunked(pairs, batch_size), start=1):
@@ -184,11 +207,19 @@ def write_log(
     log_path: Union[str, Path],
     scores: np.ndarray,
     append: bool,
+    model_path: Union[str, Path],
+    text_prefix: str,
+    score_weight: float,
+    output_scale: float,
 ):
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     lines = [
+        f"CLIPScore model_path: {model_path}",
+        f"CLIPScore text_prefix: {text_prefix!r}",
+        f"CLIPScore score_weight: {score_weight}",
+        f"CLIPScore output_scale: {output_scale}",
         f"CLIPScore: {format_mean_std(scores)}",
         f"num_images: {len(scores)}",
     ]
@@ -209,6 +240,9 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--text_prefix", type=str, default="A photo depicts ")
+    parser.add_argument("--score_weight", type=float, default=2.5)
+    parser.add_argument("--output_scale", type=float, default=1.0)
     parser.add_argument("--overwrite_log", action="store_true")
     return parser.parse_args()
 
@@ -221,10 +255,17 @@ if __name__ == "__main__":
         device=args.device,
         batch_size=args.batch_size,
         limit=args.limit,
+        text_prefix=args.text_prefix,
+        score_weight=args.score_weight,
+        output_scale=args.output_scale,
     )
     used_device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     write_log(
         log_path=args.log_path,
         scores=scores,
         append=not args.overwrite_log,
+        model_path=args.model_path,
+        text_prefix=args.text_prefix,
+        score_weight=args.score_weight,
+        output_scale=args.output_scale,
     )
