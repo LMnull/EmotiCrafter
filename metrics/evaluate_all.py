@@ -14,7 +14,7 @@ DEFAULT_IMAGE_DIR = PROJECT_ROOT / "results" / "val_prompt_5x5"
 DEFAULT_LOG_PATH = PROJECT_ROOT / "log.txt"
 DEFAULT_VA_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-base-patch32")
 DEFAULT_CLIP_SCORE_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-large-patch14")
-DEFAULT_CLIP_IQA_MODEL_PATH = Path("/root/shared-nvme/model/clip-vit-large-patch14")
+DEFAULT_CLIP_IQA_MODEL_PATH = Path("/root/shared-nvme/model/RN50.pt")
 DEFAULT_AROUSAL_CKPT = METRICS_DIR / "arousal1_CLIP_lr=0.001_loss=MSELoss_sc=test_cuda-1.pth"
 DEFAULT_VALENCE_CKPT = METRICS_DIR / "valence1_CLIP_lr=0.0001_loss=MSELoss_sc=test_cuda.pth"
 
@@ -116,6 +116,7 @@ def parse_args():
     parser.add_argument("--clip_iqa_positive_prompt", type=str, default="Good photo.")
     parser.add_argument("--clip_iqa_negative_prompt", type=str, default="Bad photo.")
     parser.add_argument("--clip_iqa_logit_scale", choices=["learned", "100"], default="learned")
+    parser.add_argument("--clip_iqa_backend", choices=["auto", "transformers", "openai_clip"], default="auto")
     return parser.parse_args()
 
 
@@ -139,9 +140,6 @@ def main():
         device=used_device,
         batch_size=args.batch_size,
         limit=args.limit,
-        positive_prompt=args.clip_iqa_positive_prompt,
-        negative_prompt=args.clip_iqa_negative_prompt,
-        logit_scale=args.clip_iqa_logit_scale,
     )
 
     print("Running CLIPScore evaluation...", flush=True)
@@ -160,6 +158,10 @@ def main():
         device=used_device,
         batch_size=args.batch_size,
         limit=args.limit,
+        positive_prompt=args.clip_iqa_positive_prompt,
+        negative_prompt=args.clip_iqa_negative_prompt,
+        logit_scale=args.clip_iqa_logit_scale,
+        backend=args.clip_iqa_backend,
     )
 
     ended_at = datetime.now(timezone.utc).astimezone()
