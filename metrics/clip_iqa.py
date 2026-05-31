@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from typing import List, Optional, Sequence, Union
+from typing import List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -17,15 +17,19 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 class CLIPIQA:
     """
-    CLIP-IQA style no-reference image quality score.
+    CLIP-IQA no-reference image quality score.
 
-    Scores are in the same 0-1 range as the original implementation in this repo.
+    This follows the official CLIP-IQA fixed-prompt formulation:
+    compute similarities to a positive/negative prompt pair and return the
+    softmax probability of the positive prompt.
     """
 
     def __init__(
         self,
         model_path: Union[str, Path] = DEFAULT_MODEL_PATH,
         device: Optional[str] = None,
+        prompt_pair: Tuple[str, str] = ("Good photo.", "Bad photo."),
+        logit_scale: Literal["learned", "100"] = "learned",
     ):
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -37,16 +41,12 @@ class CLIPIQA:
         self.model = CLIPModel.from_pretrained(str(model_path)).to(self.device)
         self.processor = CLIPProcessor.from_pretrained(str(model_path))
         self.model.eval()
+        self.logit_scale = logit_scale
 
-        self.quality_levels = [
-            "excellent quality",
-            "good quality",
-            "fair quality",
-            "poor quality",
-            "bad quality",
-        ]
-        self.quality_scores = torch.tensor([100, 75, 50, 25, 0], dtype=torch.float32, device=self.device)
-        self.anchor_features = self.encode_text_prompts(self.quality_levels)
+        if len(prompt_pair) != 2:
+            raise ValueError("prompt_pair must contain exactly two prompts: positive and negative.")
+        self.prompt_pair = prompt_pair
+        self.anchor_features = self.encode_text_prompts(self.prompt_pair)
 
     def encode_text_prompts(self, prompts: Sequence[str]) -> torch.Tensor:
         inputs = self.processor(
@@ -82,8 +82,13 @@ class CLIPIQA:
     def compute_quality_scores(self, images: Sequence[Union[str, Path, Image.Image]]) -> np.ndarray:
         image_features = self.encode_images(images)
         similarities = image_features @ self.anchor_features.T
-        weights = F.softmax(similarities * 10, dim=-1)
-        scores = (weights * self.quality_scores).sum(dim=-1) / 100
+        if self.logit_scale == "learned":
+            scale = self.model.logit_scale.exp().to(similarities.device)
+        elif self.logit_scale == "100":
+            scale = 100.0
+        else:
+            raise ValueError("logit_scale must be either 'learned' or '100'")
+        scores = F.softmax(similarities * scale, dim=-1)[:, 0]
         return scores.detach().cpu().numpy()
 
     def compute_quality_score(self, image: Union[str, Path, Image.Image]) -> float:
@@ -115,6 +120,9 @@ def evaluate_directory(
     device: Optional[str],
     batch_size: int,
     limit: Optional[int] = None,
+    positive_prompt: str = "Good photo.",
+    negative_prompt: str = "Bad photo.",
+    logit_scale: Literal["learned", "100"] = "learned",
 ) -> np.ndarray:
     if batch_size < 1:
         raise ValueError("batch_size must be greater than 0")
@@ -125,7 +133,12 @@ def evaluate_directory(
     if not image_paths:
         raise ValueError(f"No valid images found in {image_dir}")
 
-    metric = CLIPIQA(model_path=model_path, device=device)
+    metric = CLIPIQA(
+        model_path=model_path,
+        device=device,
+        prompt_pair=(positive_prompt, negative_prompt),
+        logit_scale=logit_scale,
+    )
     all_scores: List[float] = []
 
     for batch_index, batch in enumerate(chunked(image_paths, batch_size), start=1):
@@ -165,6 +178,9 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--positive_prompt", type=str, default="Good photo.")
+    parser.add_argument("--negative_prompt", type=str, default="Bad photo.")
+    parser.add_argument("--logit_scale", choices=["learned", "100"], default="learned")
     parser.add_argument("--overwrite_log", action="store_true")
     return parser.parse_args()
 
@@ -177,6 +193,9 @@ if __name__ == "__main__":
         device=args.device,
         batch_size=args.batch_size,
         limit=args.limit,
+        positive_prompt=args.positive_prompt,
+        negative_prompt=args.negative_prompt,
+        logit_scale=args.logit_scale,
     )
     used_device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     write_log(

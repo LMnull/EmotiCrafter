@@ -113,6 +113,9 @@ def parse_args():
     parser.add_argument("--valence_ckpt", type=Path, default=DEFAULT_VALENCE_CKPT)
     parser.add_argument("--clip_score_model_path", type=Path, default=DEFAULT_CLIP_SCORE_MODEL_PATH)
     parser.add_argument("--clip_iqa_model_path", type=Path, default=DEFAULT_CLIP_IQA_MODEL_PATH)
+    parser.add_argument("--clip_iqa_positive_prompt", type=str, default="Good photo.")
+    parser.add_argument("--clip_iqa_negative_prompt", type=str, default="Bad photo.")
+    parser.add_argument("--clip_iqa_logit_scale", choices=["learned", "100"], default="learned")
     return parser.parse_args()
 
 
@@ -136,6 +139,9 @@ def main():
         device=used_device,
         batch_size=args.batch_size,
         limit=args.limit,
+        positive_prompt=args.clip_iqa_positive_prompt,
+        negative_prompt=args.clip_iqa_negative_prompt,
+        logit_scale=args.clip_iqa_logit_scale,
     )
 
     print("Running CLIPScore evaluation...", flush=True)
